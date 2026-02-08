@@ -1,31 +1,21 @@
 # main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, List, Optional, Union, Dict
+from fastapi import FastAPI, Request
+from typing import Any, List
 
 app = FastAPI()
 
-# ChatGPT Actions may send file refs as strings OR as objects.
-OpenAIFileRef = Union[str, Dict[str, Any]]
+@app.post("/parse_poker_pdf")
+async def parse_poker_pdf(request: Request):
+    body: Any = await request.json()
 
-class ParseRequest(BaseModel):
-    openaiFileIdRefs: List[OpenAIFileRef]
-    options: Optional[dict] = None
+    # Safely extract file refs no matter how ChatGPT sends them
+    raw_refs = body.get("openaiFileIdRefs", [])
+    normalized: List[str] = []
 
-class ParseResponse(BaseModel):
-    hand_history_text: str
-    warnings: List[str]
-    hands_detected: int
-
-@app.post("/parse_poker_pdf", response_model=ParseResponse)
-async def parse_poker_pdf(req: ParseRequest):
-    # Normalize file refs into readable strings for debugging
-    normalized = []
-    for item in req.openaiFileIdRefs:
+    for item in raw_refs:
         if isinstance(item, str):
             normalized.append(item)
         elif isinstance(item, dict):
-            # Try common keys
             normalized.append(
                 item.get("id")
                 or item.get("file_id")
@@ -55,11 +45,11 @@ async def parse_poker_pdf(req: ParseRequest):
         "*** SUMMARY ***\n"
     )
 
-    return ParseResponse(
-        hand_history_text=fake_text,
-        warnings=[
+    return {
+        "hand_history_text": fake_text,
+        "warnings": [
             "This is a fake response from the placeholder server.",
             f"Received file refs: {normalized}",
         ],
-        hands_detected=1,
-    )
+        "hands_detected": 1,
+    }
