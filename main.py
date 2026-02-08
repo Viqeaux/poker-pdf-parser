@@ -15,7 +15,7 @@ class ParseRequest(BaseModel):
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
 
-    pdf_infos = []
+    results = []
 
     for ref in refs:
         if isinstance(ref, dict) and "download_link" in ref:
@@ -24,31 +24,37 @@ async def parse_poker_pdf(req: ParseRequest):
             r.raise_for_status()
             pdf_bytes = r.content
 
-            # Open PDF in memory and count pages
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            page_count = doc.page_count
 
-            # Get size of first/last page (helps confirm consistent capture)
-            first = doc.load_page(0).rect
-            last = doc.load_page(page_count - 1).rect
-            doc.close()
-
-            pdf_infos.append({
+            info = {
                 "bytes": len(pdf_bytes),
-                "pages": page_count,
-                "first_page_size_pts": [float(first.width), float(first.height)],
-                "last_page_size_pts": [float(last.width), float(last.height)],
-            })
+                "pages": doc.page_count,
+                "rendered_pages": []
+            }
+
+            # Render first two pages (or fewer if short PDF)
+            pages_to_render = min(2, doc.page_count)
+            for i in range(pages_to_render):
+                page = doc.load_page(i)
+                pix = page.get_pixmap(dpi=150)
+                info["rendered_pages"].append({
+                    "page_index": i,
+                    "image_width_px": pix.width,
+                    "image_height_px": pix.height
+                })
+
+            doc.close()
+            results.append(info)
 
     return {
         "hand_history_text": (
             "DEBUG MODE\n"
             f"Files received: {len(refs)}\n"
-            f"PDF infos: {pdf_infos}"
+            f"PDF render info: {results}"
         ),
         "warnings": [
             "Parser is in DEBUG mode.",
-            "Only downloading PDFs and counting pages (no poker parsing yet)."
+            "Rendered first two pages to images (no OCR, no poker parsing)."
         ],
         "hands_detected": 0,
     }
