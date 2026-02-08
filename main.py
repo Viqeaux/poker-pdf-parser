@@ -1,12 +1,15 @@
 # main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, List, Optional, Union, Dict
 
 app = FastAPI()
 
+# ChatGPT Actions may send file refs as strings OR as objects.
+OpenAIFileRef = Union[str, Dict[str, Any]]
+
 class ParseRequest(BaseModel):
-    openaiFileIdRefs: List[str]
+    openaiFileIdRefs: List[OpenAIFileRef]
     options: Optional[dict] = None
 
 class ParseResponse(BaseModel):
@@ -16,8 +19,22 @@ class ParseResponse(BaseModel):
 
 @app.post("/parse_poker_pdf", response_model=ParseResponse)
 async def parse_poker_pdf(req: ParseRequest):
-    # This is a placeholder implementation that proves the endpoint works.
-    # It returns a fake PokerStars-style hand history so you can finish wiring.
+    # Normalize file refs into readable strings for debugging
+    normalized = []
+    for item in req.openaiFileIdRefs:
+        if isinstance(item, str):
+            normalized.append(item)
+        elif isinstance(item, dict):
+            # Try common keys
+            normalized.append(
+                item.get("id")
+                or item.get("file_id")
+                or item.get("name")
+                or str(item)
+            )
+        else:
+            normalized.append(str(item))
+
     fake_text = (
         "PokerStars Hand #0000000000:  No Limit Hold'em ($0.02/$0.05 USD) - 2026/01/01 00:00:00 ET\n"
         "Table 'Test Table' 6-max Seat #1 is the button\n"
@@ -37,8 +54,12 @@ async def parse_poker_pdf(req: ParseRequest):
         "Player2 collected $0.12 from pot\n"
         "*** SUMMARY ***\n"
     )
+
     return ParseResponse(
         hand_history_text=fake_text,
-        warnings=["This is a fake response from the placeholder server."],
+        warnings=[
+            "This is a fake response from the placeholder server.",
+            f"Received file refs: {normalized}",
+        ],
         hands_detected=1,
     )
