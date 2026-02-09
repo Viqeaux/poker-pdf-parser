@@ -74,6 +74,55 @@ def crop_to_small_base64_jpeg(img: Image.Image, box: List[int], max_width: int =
     return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
+def activity_for_box(img: Image.Image, box: List[int]) -> float:
+    """
+    Compute an "activity" score (avg stddev across RGB) for a given pixel box.
+    """
+    crop = img.crop(tuple(box))
+    stat = ImageStat.Stat(crop)
+    stddev = [float(x) for x in stat.stddev]
+    return float(sum(stddev) / max(len(stddev), 1))
+
+
+def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
+    """
+    Split the board region into 5 fixed card slots:
+    flop1, flop2, flop3, turn, river.
+
+    This assumes the board region tightly covers the community-card band.
+    The exact fractions may need tuning after we see stats.
+    """
+    left, top, right, bottom = board_box
+    bw = right - left
+    bh = bottom - top
+
+    # Inner padding so we don't include table felt edges
+    pad_x = int(bw * 0.04)
+    pad_y = int(bh * 0.12)
+
+    x0 = left + pad_x
+    y0 = top + pad_y
+    x1 = right - pad_x
+    y1 = bottom - pad_y
+
+    inner_w = x1 - x0
+    inner_h = y1 - y0
+
+    # 5 slots across. Assume small gaps between cards.
+    gap = int(inner_w * 0.02)
+    slot_w = int((inner_w - gap * 4) / 5)
+    slot_h = int(inner_h)
+
+    boxes: Dict[str, List[int]] = {}
+    names = ["flop1", "flop2", "flop3", "turn", "river"]
+    for idx, name in enumerate(names):
+        sx0 = x0 + idx * (slot_w + gap)
+        sx1 = sx0 + slot_w
+        boxes[name] = [sx0, y0, sx1, y0 + slot_h]
+
+    return boxes
+
+
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
@@ -85,6 +134,10 @@ async def parse_poker_pdf(req: ParseRequest):
     max_crops: int = int(opts.get("max_crops", 2))
     crop_max_width: int = int(opts.get("crop_max_width", 260))
     crop_quality: int = int(opts.get("crop_quality", 35))
+
+    # Card-slot stats (no crops): how many pages to sample once first_active_page is found
+    # 2 means [first_active_page, first_active_page+1]
+    slot_pages: int = int(opts.get("slot_pages", 2))
 
     results: List[Dict[str, Any]] = []
 
@@ -149,16 +202,13 @@ async def parse_poker_pdf(req: ParseRequest):
             sample_board_crops: List[Dict[str, Any]] = []
             if include_crops:
                 sample_pages: List[int] = []
-                # Prefer the detected first active page; also include the next page if possible
                 if first_active_page is not None:
                     sample_pages.append(first_active_page)
                     if first_active_page + 1 < total_pages:
                         sample_pages.append(first_active_page + 1)
-                # Fallback to page 0 if nothing detected
                 if not sample_pages:
                     sample_pages = [0]
 
-                # Deduplicate and cap
                 seen = set()
                 sample_pages_clean: List[int] = []
                 for p in sample_pages:
@@ -186,6 +236,43 @@ async def parse_poker_pdf(req: ParseRequest):
                     except Exception as e:
                         sample_board_crops.append({"page_index": p, "error": f"{type(e).__name__}: {str(e)}"})
 
+            # NEW: Card-slot activity stats (no crops)
+            card_slot_stats: List[Dict[str, Any]] = []
+            if first_active_page is not None and crop_box_px is not None and slot_pages > 0:
+                pages_to_sample: List[int] = []
+                for k in range(slot_pages):
+                    p = first_active_page + k
+                    if 0 <= p < total_pages:
+                        pages_to_sample.append(p)
+
+                for p in pages_to_sample:
+                    try:
+                        img = render_page_to_pil(doc, p, dpi=150)
+                        board_box = board_region_box(img)  # recompute from img to be safe
+                        slot_boxes = card_slot_boxes_from_board(board_box)
+
+                        slots_out: Dict[str, Any] = {}
+                        for name, box in slot_boxes.items():
+                            slots_out[name] = {
+                                "slot_box_px": box,
+                                "activity": activity_for_box(img, box),
+                            }
+
+                        card_slot_stats.append(
+                            {
+                                "page_index": p,
+                                "board_box_px": board_box,
+                                "slots": slots_out,
+                            }
+                        )
+                    except Exception as e:
+                        card_slot_stats.append(
+                            {
+                                "page_index": p,
+                                "error": f"{type(e).__name__}: {str(e)}",
+                            }
+                        )
+
             result: Dict[str, Any] = {
                 "bytes": len(pdf_bytes),
                 "pages": total_pages,
@@ -199,6 +286,8 @@ async def parse_poker_pdf(req: ParseRequest):
                 "baseline_ratio": RATIO,
                 "first_board_region_active_page": first_active_page,
                 "top_active_pages": top_active_pages,
+                "slot_pages": slot_pages,
+                "card_slot_stats": card_slot_stats,
             }
 
             if debug:
@@ -218,8 +307,8 @@ async def parse_poker_pdf(req: ParseRequest):
         "results": results,
         "notes": [
             "Crops/base64 are OFF by default to prevent ResponseTooLargeError.",
-            "Enable tiny crops by passing options.include_crops=true (still capped/compressed).",
-            "This still does not read ranks/suits yet; it detects board-region activity.",
+            "Card-slot stats are computed from a fixed 5-slot split inside the heuristic board region.",
+            "This still does not read ranks/suits yet; it provides activity-only signals per card slot.",
         ],
     }
 
@@ -227,7 +316,7 @@ async def parse_poker_pdf(req: ParseRequest):
         "hand_history_text": json.dumps(debug_payload, indent=2),
         "warnings": [
             "Parser is in DEBUG mode (lightweight) unless options.debug=false.",
-            "No OCR yet; board activity detection only.",
+            "No OCR yet; board + card-slot activity detection only.",
         ],
         "hands_detected": 0,
     }
