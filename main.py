@@ -83,11 +83,13 @@ async def parse_poker_pdf(req: ParseRequest):
                 if first_active_page is None and stats["activity"] >= THRESH_ACTIVITY:
                     first_active_page = i
 
+		total_pages = doc.page_count
+
             doc.close()
 
             results.append({
                 "bytes": len(pdf_bytes),
-                "pages": doc.page_count,
+                "pages": total_pages,
                 "scanned_pages": max_pages_to_scan,
                 "threshold_activity": THRESH_ACTIVITY,
                 "first_board_region_active_page": first_active_page,
