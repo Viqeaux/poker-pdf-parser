@@ -24,14 +24,13 @@ class ParseRequest(BaseModel):
 
 
 # ----------------------------
-# Rendering helpers
+# Rendering
 # ----------------------------
 
 def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> Image.Image:
     page = doc.load_page(page_index)
     pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return img.convert("RGB")
+    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
 # ----------------------------
@@ -51,8 +50,7 @@ def board_region_box(img: Image.Image) -> List[int]:
 def activity_for_box(img: Image.Image, box: List[int]) -> float:
     crop = img.crop(tuple(box))
     stat = ImageStat.Stat(crop)
-    stddev = [float(x) for x in stat.stddev]
-    return float(sum(stddev) / max(len(stddev), 1))
+    return sum(stat.stddev) / max(len(stat.stddev), 1)
 
 
 def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
@@ -98,36 +96,22 @@ def street_from_slots(slots: Dict[str, float]) -> str:
 # ----------------------------
 
 def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
-    """
-    Crop the top-left corner of a card where the rank lives.
-    """
     left, top, right, bottom = slot_box
     w = right - left
     h = bottom - top
-
-    return img.crop(
-        (
-            left,
-            top,
-            left + int(w * 0.35),
-            top + int(h * 0.35),
-        )
-    )
+    return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
 
 
 def ocr_rank(img: Image.Image) -> str:
     if not OCR_AVAILABLE:
-        return "ocr_unavailable"
+        return "OCR_UNAVAILABLE"
 
-    gray = ImageOps.grayscale(img)
-    gray = ImageOps.autocontrast(gray)
-
+    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
     text = pytesseract.image_to_string(
         gray,
         config="--psm 10 -c tessedit_char_whitelist=AKQJT98765432"
-    )
+    ).strip().upper()
 
-    text = text.strip().upper()
     return text if text else "?"
 
 
@@ -160,11 +144,11 @@ async def parse_poker_pdf(req: ParseRequest):
             for i in range(pages):
                 img = render_page_to_pil(doc, i)
                 board_box = board_region_box(img)
-                slots = card_slot_boxes_from_board(board_box)
+                slot_boxes = card_slot_boxes_from_board(board_box)
 
                 slot_activity = {
                     name: activity_for_box(img, box)
-                    for name, box in slots.items()
+                    for name, box in slot_boxes.items()
                 }
 
                 street = street_from_slots(slot_activity)
@@ -204,10 +188,14 @@ async def parse_poker_pdf(req: ParseRequest):
                 current["partial"] = True
                 hands.append(current)
 
-            # OCR one representative page per hand
+            # -------- FORCE OCR OUTPUT --------
             ocr_results = []
+
             for h in hands:
-                page_idx = h["start_page_index"]
+                # Prefer TURN page if possible
+                candidate_pages = [h["start_page_index"], h["end_page_index"]]
+                page_idx = next((p for p in candidate_pages if isinstance(p, int)), h["start_page_index"])
+
                 img = render_page_to_pil(doc, page_idx)
                 board_box = board_region_box(img)
                 slot_boxes = card_slot_boxes_from_board(board_box)
@@ -220,13 +208,15 @@ async def parse_poker_pdf(req: ParseRequest):
 
                 ranks = {}
                 for name, box in slot_boxes.items():
-                    if (
+                    allowed = (
                         (name.startswith("flop") and street in ("FLOP", "TURN", "RIVER")) or
                         (name == "turn" and street in ("TURN", "RIVER")) or
                         (name == "river" and street == "RIVER")
-                    ):
-                        crop = rank_crop_from_slot(img, box)
-                        ranks[name] = ocr_rank(crop)
+                    )
+                    if allowed:
+                        ranks[name] = ocr_rank(rank_crop_from_slot(img, box))
+                    else:
+                        ranks[name] = None
 
                 ocr_results.append(
                     {
