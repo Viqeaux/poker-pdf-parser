@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict, Union
 import io
 import json
 import base64
@@ -120,15 +120,42 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     return boxes
 
 
-def street_state_from_slots(slots: Dict[str, Dict[str, Any]], threshold: float) -> Dict[str, Any]:
+def street_state_from_slots(
+    slots: Dict[str, Dict[str, Any]],
+    thresholds: Union[float, Dict[str, float]],
+) -> Dict[str, Any]:
     """
     Convert slot activity into a simple board/street state.
+
+    thresholds can be:
+      - float (single threshold for all slots)
+      - dict with keys: "flop", "turn", "river"
+        where flop threshold applies to flop1/2/3, etc.
     """
+    if isinstance(thresholds, dict):
+        flop_t = float(thresholds.get("flop", 20.0))
+        turn_t = float(thresholds.get("turn", 50.0))
+        river_t = float(thresholds.get("river", 50.0))
+    else:
+        # Back-compat: if user provides a single value, use it for flop,
+        # but keep safer defaults for turn/river to avoid false positives.
+        flop_t = float(thresholds)
+        turn_t = max(50.0, float(thresholds))
+        river_t = max(50.0, float(thresholds))
+
     def present(name: str) -> bool:
         try:
-            return float(slots[name]["activity"]) >= threshold
+            act = float(slots[name]["activity"])
         except Exception:
             return False
+
+        if name in ("flop1", "flop2", "flop3"):
+            return act >= flop_t
+        if name == "turn":
+            return act >= turn_t
+        if name == "river":
+            return act >= river_t
+        return False
 
     flop_present_count = sum(1 for n in ["flop1", "flop2", "flop3"] if present(n))
     flop_present = flop_present_count == 3
@@ -145,7 +172,7 @@ def street_state_from_slots(slots: Dict[str, Dict[str, Any]], threshold: float) 
         street = "PREFLOP"
 
     return {
-        "threshold": float(threshold),
+        "thresholds": {"flop": flop_t, "turn": turn_t, "river": river_t},
         "flop_present_count": int(flop_present_count),
         "flop_present": bool(flop_present),
         "turn_present": bool(turn_present),
@@ -169,8 +196,8 @@ async def parse_poker_pdf(req: ParseRequest):
     # Card-slot stats pages
     slot_pages: int = int(opts.get("slot_pages", 2))
 
-    # Presence threshold for card slots
-    slot_presence_threshold: float = float(opts.get("slot_presence_threshold", 20.0))
+    # Thresholds: allow either float (legacy) or dict {"flop":20,"turn":50,"river":50}
+    slot_thresholds = opts.get("slot_thresholds", {"flop": 20.0, "turn": 50.0, "river": 50.0})
 
     results: List[Dict[str, Any]] = []
 
@@ -291,7 +318,7 @@ async def parse_poker_pdf(req: ParseRequest):
                                 "activity": activity_for_box(img, box),
                             }
 
-                        street_state = street_state_from_slots(slots_out, slot_presence_threshold)
+                        street_state = street_state_from_slots(slots_out, slot_thresholds)
 
                         card_slot_stats.append(
                             {
@@ -323,7 +350,11 @@ async def parse_poker_pdf(req: ParseRequest):
                 "first_board_region_active_page": first_active_page,
                 "top_active_pages": top_active_pages,
                 "slot_pages": slot_pages,
-                "slot_presence_threshold": slot_presence_threshold,
+                "slot_thresholds": street_state_from_slots(
+                    # safe dummy for echoing actual thresholds used, replaced below if slots computed
+                    {"flop1": {"activity": 0}, "flop2": {"activity": 0}, "flop3": {"activity": 0}, "turn": {"activity": 0}, "river": {"activity": 0}},
+                    slot_thresholds
+                )["thresholds"],
                 "card_slot_stats": card_slot_stats,
             }
 
@@ -345,7 +376,7 @@ async def parse_poker_pdf(req: ParseRequest):
         "notes": [
             "Crops/base64 are OFF by default to prevent ResponseTooLargeError.",
             "Card-slot stats are computed from a fixed 5-slot split inside the heuristic board region.",
-            "street_state is derived from slot activity using slot_presence_threshold.",
+            "street_state uses slot-specific thresholds (flop/turn/river) to reduce false positives.",
             "This still does not read ranks/suits yet; it provides activity-only signals per card slot.",
         ],
     }
