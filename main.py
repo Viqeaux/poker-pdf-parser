@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Any, List, Optional, Dict, Union
+from typing import Any, List, Optional, Dict, Union, Tuple
 import io
 import json
 import base64
@@ -137,8 +137,6 @@ def street_state_from_slots(
         turn_t = float(thresholds.get("turn", 50.0))
         river_t = float(thresholds.get("river", 50.0))
     else:
-        # Back-compat: if user provides a single value, use it for flop,
-        # but keep safer defaults for turn/river to avoid false positives.
         flop_t = float(thresholds)
         turn_t = max(50.0, float(thresholds))
         river_t = max(50.0, float(thresholds))
@@ -181,6 +179,67 @@ def street_state_from_slots(
     }
 
 
+def collapse_street_timeline(page_streets: List[Tuple[int, str]]) -> List[Dict[str, Any]]:
+    """
+    Given (page_index, street) for pages, collapse consecutive duplicates.
+    """
+    out: List[Dict[str, Any]] = []
+    last: Optional[str] = None
+    for page_index, street in page_streets:
+        if last is None or street != last:
+            out.append({"page_index": int(page_index), "street": street})
+            last = street
+    return out
+
+
+def infer_hand_windows(street_timeline: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Very lightweight heuristic:
+    - A hand "starts" when we enter FLOP/TURN/RIVER from PREFLOP
+    - A hand "ends" when we transition back to PREFLOP after having been in a later street
+    This yields page-index windows; it is intentionally conservative.
+    """
+    windows: List[Dict[str, Any]] = []
+    active_start: Optional[int] = None
+    active_seen_postflop_hint = False  # any street != PREFLOP
+
+    for i, item in enumerate(street_timeline):
+        page = int(item["page_index"])
+        street = str(item["street"])
+
+        if street != "PREFLOP":
+            active_seen_postflop_hint = True
+            if active_start is None:
+                active_start = page
+
+        if street == "PREFLOP" and active_start is not None and active_seen_postflop_hint:
+            # end page is previous change-point page (best we can do from change points)
+            prev_page = int(street_timeline[i - 1]["page_index"]) if i > 0 else page
+            windows.append(
+                {
+                    "hand_index": len(windows) + 1,
+                    "start_page_index": active_start,
+                    "end_page_index": prev_page,
+                    "end_reason": "street_reset_to_preflop",
+                }
+            )
+            active_start = None
+            active_seen_postflop_hint = False
+
+    # If we end still in an active hand, leave it open-ended
+    if active_start is not None and active_seen_postflop_hint:
+        windows.append(
+            {
+                "hand_index": len(windows) + 1,
+                "start_page_index": active_start,
+                "end_page_index": None,
+                "end_reason": "end_of_scan",
+            }
+        )
+
+    return windows
+
+
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
@@ -193,8 +252,12 @@ async def parse_poker_pdf(req: ParseRequest):
     crop_max_width: int = int(opts.get("crop_max_width", 260))
     crop_quality: int = int(opts.get("crop_quality", 35))
 
-    # Card-slot stats pages
+    # Card-slot stats pages (detail view around first_active_page)
     slot_pages: int = int(opts.get("slot_pages", 2))
+
+    # Timeline mode: compute street for every scanned page and collapse changes
+    timeline: bool = bool(opts.get("timeline", True))
+    include_hand_windows: bool = bool(opts.get("include_hand_windows", True))
 
     # Thresholds: allow either float (legacy) or dict {"flop":20,"turn":50,"river":50}
     slot_thresholds = opts.get("slot_thresholds", {"flop": 20.0, "turn": 50.0, "river": 50.0})
@@ -214,7 +277,7 @@ async def parse_poker_pdf(req: ParseRequest):
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         try:
             total_pages = doc.page_count
-            max_pages_to_scan = min(75, total_pages)
+            max_pages_to_scan = min(int(opts.get("max_pages_to_scan", 75)), total_pages)
 
             # Baseline-jump detector settings
             BASELINE_PAGES = int(opts.get("baseline_pages", 8))
@@ -225,6 +288,9 @@ async def parse_poker_pdf(req: ParseRequest):
             per_page: List[Dict[str, Any]] = []
             crop_box_px: Optional[List[int]] = None
             render_size_px: Optional[List[int]] = None
+
+            # Timeline helpers
+            page_streets: List[Tuple[int, str]] = []
 
             # Scan pages
             for i in range(max_pages_to_scan):
@@ -241,6 +307,16 @@ async def parse_poker_pdf(req: ParseRequest):
 
                 if debug:
                     per_page.append({"page_index": i, "activity": act})
+
+                if timeline:
+                    # compute street state from slot activity for this page
+                    board_box = board_region_box(img)
+                    slot_boxes = card_slot_boxes_from_board(board_box)
+                    slots_out: Dict[str, Any] = {}
+                    for name, box in slot_boxes.items():
+                        slots_out[name] = {"activity": activity_for_box(img, box)}
+                    street_state = street_state_from_slots(slots_out, slot_thresholds)
+                    page_streets.append((i, street_state["street"]))
 
             # Baseline = median of first BASELINE_PAGES
             baseline_slice = activities[: min(BASELINE_PAGES, len(activities))]
@@ -296,7 +372,7 @@ async def parse_poker_pdf(req: ParseRequest):
                     except Exception as e:
                         sample_board_crops.append({"page_index": p, "error": f"{type(e).__name__}: {str(e)}"})
 
-            # Card-slot activity stats + street_state
+            # Card-slot activity stats + street_state (detail view around first_active_page)
             card_slot_stats: List[Dict[str, Any]] = []
             if first_active_page is not None and crop_box_px is not None and slot_pages > 0:
                 pages_to_sample: List[int] = []
@@ -329,12 +405,7 @@ async def parse_poker_pdf(req: ParseRequest):
                             }
                         )
                     except Exception as e:
-                        card_slot_stats.append(
-                            {
-                                "page_index": p,
-                                "error": f"{type(e).__name__}: {str(e)}",
-                            }
-                        )
+                        card_slot_stats.append({"page_index": p, "error": f"{type(e).__name__}: {str(e)}"})
 
             result: Dict[str, Any] = {
                 "bytes": len(pdf_bytes),
@@ -351,7 +422,6 @@ async def parse_poker_pdf(req: ParseRequest):
                 "top_active_pages": top_active_pages,
                 "slot_pages": slot_pages,
                 "slot_thresholds": street_state_from_slots(
-                    # safe dummy for echoing actual thresholds used, replaced below if slots computed
                     {"flop1": {"activity": 0}, "flop2": {"activity": 0}, "flop3": {"activity": 0}, "turn": {"activity": 0}, "river": {"activity": 0}},
                     slot_thresholds
                 )["thresholds"],
@@ -363,6 +433,12 @@ async def parse_poker_pdf(req: ParseRequest):
 
             if include_crops:
                 result["sample_board_crops"] = sample_board_crops
+
+            if timeline:
+                street_timeline = collapse_street_timeline(page_streets)
+                result["street_timeline"] = street_timeline
+                if include_hand_windows:
+                    result["hand_windows"] = infer_hand_windows(street_timeline)
 
             results.append(result)
 
@@ -377,6 +453,8 @@ async def parse_poker_pdf(req: ParseRequest):
             "Crops/base64 are OFF by default to prevent ResponseTooLargeError.",
             "Card-slot stats are computed from a fixed 5-slot split inside the heuristic board region.",
             "street_state uses slot-specific thresholds (flop/turn/river) to reduce false positives.",
+            "street_timeline collapses per-page street into change points to keep output small.",
+            "hand_windows are heuristic page ranges inferred from street_timeline resets.",
             "This still does not read ranks/suits yet; it provides activity-only signals per card slot.",
         ],
     }
