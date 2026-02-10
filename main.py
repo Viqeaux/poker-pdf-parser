@@ -18,14 +18,18 @@ except Exception:
 app = FastAPI()
 
 
+# ============================
+# Models
+# ============================
+
 class ParseRequest(BaseModel):
     openaiFileIdRefs: List[Any]
     options: Optional[dict] = None
 
 
-# ----------------------------
+# ============================
 # Rendering
-# ----------------------------
+# ============================
 
 def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> Image.Image:
     page = doc.load_page(page_index)
@@ -33,9 +37,9 @@ def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> I
     return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
 
-# ----------------------------
+# ============================
 # Geometry + activity
-# ----------------------------
+# ============================
 
 def board_region_box(img: Image.Image) -> List[int]:
     w, h = img.size
@@ -50,15 +54,16 @@ def board_region_box(img: Image.Image) -> List[int]:
 def activity_for_box(img: Image.Image, box: List[int]) -> float:
     crop = img.crop(tuple(box))
     stat = ImageStat.Stat(crop)
-    return sum(stat.stddev) / max(len(stat.stddev), 1)
+    return float(sum(stat.stddev) / max(len(stat.stddev), 1))
 
 
 def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     left, top, right, bottom = board_box
     bw = right - left
+    bh = bottom - top
 
     pad_x = int(bw * 0.04)
-    pad_y = int((bottom - top) * 0.12)
+    pad_y = int(bh * 0.12)
 
     x0 = left + pad_x
     y0 = top + pad_y
@@ -69,55 +74,67 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     gap = int(inner_w * 0.02)
     slot_w = int((inner_w - gap * 4) / 5)
 
-    boxes = {}
-    for i, name in enumerate(["flop1", "flop2", "flop3", "turn", "river"]):
+    boxes: Dict[str, List[int]] = {}
+    names = ["flop1", "flop2", "flop3", "turn", "river"]
+
+    for i, name in enumerate(names):
         sx0 = x0 + i * (slot_w + gap)
         boxes[name] = [sx0, y0, sx0 + slot_w, y1]
 
     return boxes
 
 
-# ----------------------------
+# ============================
 # Street logic
-# ----------------------------
+# ============================
 
 def street_from_slots(slots: Dict[str, float]) -> str:
-    if slots["river"] >= 50:
+    if slots.get("river", 0) >= 50:
         return "RIVER"
-    if slots["turn"] >= 50:
+    if slots.get("turn", 0) >= 50:
         return "TURN"
-    if sum(1 for k in ("flop1", "flop2", "flop3") if slots[k] >= 20) == 3:
+    if sum(1 for k in ("flop1", "flop2", "flop3") if slots.get(k, 0) >= 20) == 3:
         return "FLOP"
     return "PREFLOP"
 
 
-# ----------------------------
-# OCR (rank only)
-# ----------------------------
+# ============================
+# OCR (rank only, best effort)
+# ============================
 
 def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
     left, top, right, bottom = slot_box
     w = right - left
     h = bottom - top
-    return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
+    return img.crop(
+        (
+            left,
+            top,
+            left + int(w * 0.35),
+            top + int(h * 0.35),
+        )
+    )
 
 
 def ocr_rank(img: Image.Image) -> str:
     if not OCR_AVAILABLE:
         return "OCR_UNAVAILABLE"
 
-    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
+    gray = ImageOps.grayscale(img)
+    gray = ImageOps.autocontrast(gray)
+
     text = pytesseract.image_to_string(
         gray,
         config="--psm 10 -c tessedit_char_whitelist=AKQJT98765432"
-    ).strip().upper()
+    )
 
+    text = text.strip().upper()
     return text if text else "?"
 
 
-# ----------------------------
+# ============================
 # API
-# ----------------------------
+# ============================
 
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
@@ -127,7 +144,7 @@ async def parse_poker_pdf(req: ParseRequest):
     max_pages = int(opts.get("max_pages_to_scan", 75))
     max_gap_pages = int(opts.get("max_gap_pages", 10))
 
-    results = []
+    results: List[Dict[str, Any]] = []
 
     for ref in refs:
         if not isinstance(ref, dict) or "download_link" not in ref:
@@ -138,9 +155,11 @@ async def parse_poker_pdf(req: ParseRequest):
 
         try:
             pages = min(doc.page_count, max_pages)
-            timeline = []
+            street_timeline: List[Dict[str, Any]] = []
 
-            last_street = None
+            last_street: Optional[str] = None
+
+            # -------- Timeline pass --------
             for i in range(pages):
                 img = render_page_to_pil(doc, i)
                 board_box = board_region_box(img)
@@ -153,48 +172,54 @@ async def parse_poker_pdf(req: ParseRequest):
 
                 street = street_from_slots(slot_activity)
                 if street != last_street:
-                    timeline.append({"page_index": i, "street": street})
+                    street_timeline.append({"page_index": i, "street": street})
                     last_street = street
 
-            # Hand windows
-            hands = []
+            # -------- Hand window detection --------
+            hand_windows: List[Dict[str, Any]] = []
             current = None
             last_page = None
             hand_index = 0
 
-            for entry in timeline:
-                p = entry["page_index"]
-                s = entry["street"]
+            for entry in street_timeline:
+                page_idx = entry["page_index"]
+                street = entry["street"]
 
-                if s == "FLOP" and current is None:
+                if street == "FLOP" and current is None:
                     hand_index += 1
                     current = {
                         "hand_index": hand_index,
-                        "start_page_index": p,
+                        "start_page_index": page_idx,
                         "end_page_index": None,
                         "partial": True,
                     }
 
-                if current and last_page is not None and (p - last_page) > max_gap_pages:
-                    current["end_page_index"] = last_page
-                    current["partial"] = True
-                    hands.append(current)
-                    current = None
+                if current and last_page is not None:
+                    if page_idx - last_page > max_gap_pages:
+                        current["end_page_index"] = last_page
+                        current["partial"] = True
+                        hand_windows.append(current)
+                        current = None
 
-                last_page = p
+                last_page = page_idx
 
             if current:
                 current["end_page_index"] = last_page
                 current["partial"] = True
-                hands.append(current)
+                hand_windows.append(current)
 
-            # -------- FORCE OCR OUTPUT --------
-            ocr_results = []
+            # -------- OCR per hand (best effort) --------
+            card_rank_ocr: List[Dict[str, Any]] = []
 
-            for h in hands:
-                # Prefer TURN page if possible
-                candidate_pages = [h["start_page_index"], h["end_page_index"]]
-                page_idx = next((p for p in candidate_pages if isinstance(p, int)), h["start_page_index"])
+            for hand in hand_windows:
+                candidate_pages = [
+                    hand.get("end_page_index"),
+                    hand.get("start_page_index"),
+                ]
+                page_idx = next(
+                    (p for p in candidate_pages if isinstance(p, int)),
+                    hand["start_page_index"],
+                )
 
                 img = render_page_to_pil(doc, page_idx)
                 board_box = board_region_box(img)
@@ -204,23 +229,21 @@ async def parse_poker_pdf(req: ParseRequest):
                     name: activity_for_box(img, box)
                     for name, box in slot_boxes.items()
                 }
-                street = street_from_slots(slot_activity)
 
-                ranks = {}
+                street = street_from_slots(slot_activity)
+                ranks: Dict[str, Optional[str]] = {}
+
                 for name, box in slot_boxes.items():
                     allowed = (
                         (name.startswith("flop") and street in ("FLOP", "TURN", "RIVER")) or
                         (name == "turn" and street in ("TURN", "RIVER")) or
                         (name == "river" and street == "RIVER")
                     )
-                    if allowed:
-                        ranks[name] = ocr_rank(rank_crop_from_slot(img, box))
-                    else:
-                        ranks[name] = None
+                    ranks[name] = ocr_rank(rank_crop_from_slot(img, box)) if allowed else None
 
-                ocr_results.append(
+                card_rank_ocr.append(
                     {
-                        "hand_index": h["hand_index"],
+                        "hand_index": hand["hand_index"],
                         "page_index": page_idx,
                         "street": street,
                         "card_ranks_raw": ranks,
@@ -229,18 +252,17 @@ async def parse_poker_pdf(req: ParseRequest):
 
             results.append(
                 {
-                    "street_timeline": timeline,
-                    "hand_windows": hands,
-                    "card_rank_ocr": ocr_results,
+                    "street_timeline": street_timeline,
+                    "hand_windows": hand_windows,
+                    "card_rank_ocr": card_rank_ocr,
                 }
             )
 
         finally:
             doc.close()
 
-   return {
-    "BUILD_ID": "ocr-rank-v1",
-    "hand_history_text": json.dumps({"results": results}, indent=2),
-    "hands_detected": sum(len(r["hand_windows"]) for r in results),
-}
-
+    return {
+        "BUILD_ID": "ocr-rank-v1",
+        "hand_history_text": json.dumps({"results": results}, indent=2),
+        "hands_detected": sum(len(r["hand_windows"]) for r in results),
+    }
