@@ -88,9 +88,6 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     """
     Split the board region into 5 fixed card slots:
     flop1, flop2, flop3, turn, river.
-
-    This assumes the board region tightly covers the community-card band.
-    The exact fractions may need tuning after we see stats.
     """
     left, top, right, bottom = board_box
     bw = right - left
@@ -123,6 +120,40 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     return boxes
 
 
+def street_state_from_slots(slots: Dict[str, Dict[str, Any]], threshold: float) -> Dict[str, Any]:
+    """
+    Convert slot activity into a simple board/street state.
+    """
+    def present(name: str) -> bool:
+        try:
+            return float(slots[name]["activity"]) >= threshold
+        except Exception:
+            return False
+
+    flop_present_count = sum(1 for n in ["flop1", "flop2", "flop3"] if present(n))
+    flop_present = flop_present_count == 3
+    turn_present = present("turn")
+    river_present = present("river")
+
+    if river_present:
+        street = "RIVER"
+    elif turn_present:
+        street = "TURN"
+    elif flop_present:
+        street = "FLOP"
+    else:
+        street = "PREFLOP"
+
+    return {
+        "threshold": float(threshold),
+        "flop_present_count": int(flop_present_count),
+        "flop_present": bool(flop_present),
+        "turn_present": bool(turn_present),
+        "river_present": bool(river_present),
+        "street": street,
+    }
+
+
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
@@ -135,9 +166,11 @@ async def parse_poker_pdf(req: ParseRequest):
     crop_max_width: int = int(opts.get("crop_max_width", 260))
     crop_quality: int = int(opts.get("crop_quality", 35))
 
-    # Card-slot stats (no crops): how many pages to sample once first_active_page is found
-    # 2 means [first_active_page, first_active_page+1]
+    # Card-slot stats pages
     slot_pages: int = int(opts.get("slot_pages", 2))
+
+    # Presence threshold for card slots
+    slot_presence_threshold: float = float(opts.get("slot_presence_threshold", 20.0))
 
     results: List[Dict[str, Any]] = []
 
@@ -156,7 +189,7 @@ async def parse_poker_pdf(req: ParseRequest):
             total_pages = doc.page_count
             max_pages_to_scan = min(75, total_pages)
 
-            # Baseline-jump detector settings (tunable via options if you want)
+            # Baseline-jump detector settings
             BASELINE_PAGES = int(opts.get("baseline_pages", 8))
             MARGIN = float(opts.get("margin", 20.0))
             RATIO = float(opts.get("ratio", 2.0))
@@ -193,7 +226,7 @@ async def parse_poker_pdf(req: ParseRequest):
                     first_active_page = i
                     break
 
-            # Top pages by activity (small, useful)
+            # Top pages by activity
             indexed = list(enumerate(activities))
             indexed.sort(key=lambda t: t[1], reverse=True)
             top_active_pages = [{"page_index": idx, "activity": float(val)} for idx, val in indexed[:10]]
@@ -236,7 +269,7 @@ async def parse_poker_pdf(req: ParseRequest):
                     except Exception as e:
                         sample_board_crops.append({"page_index": p, "error": f"{type(e).__name__}: {str(e)}"})
 
-            # NEW: Card-slot activity stats (no crops)
+            # Card-slot activity stats + street_state
             card_slot_stats: List[Dict[str, Any]] = []
             if first_active_page is not None and crop_box_px is not None and slot_pages > 0:
                 pages_to_sample: List[int] = []
@@ -248,7 +281,7 @@ async def parse_poker_pdf(req: ParseRequest):
                 for p in pages_to_sample:
                     try:
                         img = render_page_to_pil(doc, p, dpi=150)
-                        board_box = board_region_box(img)  # recompute from img to be safe
+                        board_box = board_region_box(img)
                         slot_boxes = card_slot_boxes_from_board(board_box)
 
                         slots_out: Dict[str, Any] = {}
@@ -258,11 +291,14 @@ async def parse_poker_pdf(req: ParseRequest):
                                 "activity": activity_for_box(img, box),
                             }
 
+                        street_state = street_state_from_slots(slots_out, slot_presence_threshold)
+
                         card_slot_stats.append(
                             {
                                 "page_index": p,
                                 "board_box_px": board_box,
                                 "slots": slots_out,
+                                "street_state": street_state,
                             }
                         )
                     except Exception as e:
@@ -287,6 +323,7 @@ async def parse_poker_pdf(req: ParseRequest):
                 "first_board_region_active_page": first_active_page,
                 "top_active_pages": top_active_pages,
                 "slot_pages": slot_pages,
+                "slot_presence_threshold": slot_presence_threshold,
                 "card_slot_stats": card_slot_stats,
             }
 
@@ -308,6 +345,7 @@ async def parse_poker_pdf(req: ParseRequest):
         "notes": [
             "Crops/base64 are OFF by default to prevent ResponseTooLargeError.",
             "Card-slot stats are computed from a fixed 5-slot split inside the heuristic board region.",
+            "street_state is derived from slot activity using slot_presence_threshold.",
             "This still does not read ranks/suits yet; it provides activity-only signals per card slot.",
         ],
     }
