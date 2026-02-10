@@ -238,7 +238,9 @@ async def parse_poker_pdf(req: ParseRequest):
         finally:
             doc.close()
 
-    return {
-        "hand_history_text": json.dumps({"results": results}, indent=2),
-        "hands_detected": sum(len(r["hand_windows"]) for r in results),
-    }
+   return {
+    "BUILD_ID": "ocr-rank-v1",
+    "hand_history_text": json.dumps({"results": results}, indent=2),
+    "hands_detected": sum(len(r["hand_windows"]) for r in results),
+}
+
