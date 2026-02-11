@@ -4,19 +4,23 @@ from pydantic import BaseModel
 from typing import Any, List, Optional, Dict
 import io
 import json
-import re
+import traceback
 
 import requests
 import fitz  # PyMuPDF
 from PIL import Image, ImageStat, ImageOps
 
+# OCR optional
 try:
     import pytesseract
     OCR_AVAILABLE = True
 except Exception:
+    pytesseract = None
     OCR_AVAILABLE = False
 
 app = FastAPI()
+
+BUILD_ID = "ocr-rank-norm-v1"
 
 
 class ParseRequest(BaseModel):
@@ -27,7 +31,6 @@ class ParseRequest(BaseModel):
 # ----------------------------
 # Rendering
 # ----------------------------
-
 def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> Image.Image:
     page = doc.load_page(page_index)
     pix = page.get_pixmap(dpi=dpi)
@@ -37,7 +40,6 @@ def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> I
 # ----------------------------
 # Geometry + activity
 # ----------------------------
-
 def board_region_box(img: Image.Image) -> List[int]:
     w, h = img.size
     return [
@@ -58,9 +60,10 @@ def activity_for_box(img: Image.Image, box: List[int]) -> float:
 def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
     left, top, right, bottom = board_box
     bw = right - left
+    bh = bottom - top
 
     pad_x = int(bw * 0.04)
-    pad_y = int((bottom - top) * 0.12)
+    pad_y = int(bh * 0.12)
 
     x0 = left + pad_x
     y0 = top + pad_y
@@ -82,13 +85,14 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
 # ----------------------------
 # Street logic
 # ----------------------------
-
-def street_from_slots(slots: Dict[str, float]) -> str:
-    if slots["river"] >= 50:
+def street_from_slots(slot_activity: Dict[str, float]) -> str:
+    # tuned thresholds you’ve been using
+    if slot_activity.get("river", 0.0) >= 50.0:
         return "RIVER"
-    if slots["turn"] >= 50:
+    if slot_activity.get("turn", 0.0) >= 50.0:
         return "TURN"
-    if sum(1 for k in ("flop1", "flop2", "flop3") if slots[k] >= 20) == 3:
+    flop_count = sum(1 for k in ("flop1", "flop2", "flop3") if slot_activity.get(k, 0.0) >= 20.0)
+    if flop_count == 3:
         return "FLOP"
     return "PREFLOP"
 
@@ -96,139 +100,158 @@ def street_from_slots(slots: Dict[str, float]) -> str:
 # ----------------------------
 # OCR (rank only) + normalization
 # ----------------------------
-
-RANK_WHITELIST = "AKQJT98765432"
-
-
 def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
     left, top, right, bottom = slot_box
     w = right - left
     h = bottom - top
+    # top-left corner where rank usually sits
     return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
 
 
-def ocr_rank_raw(img: Image.Image) -> str:
-    if not OCR_AVAILABLE:
+def ocr_rank_raw(rank_crop: Image.Image) -> str:
+    if not OCR_AVAILABLE or pytesseract is None:
         return "OCR_UNAVAILABLE"
 
-    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
-    text = pytesseract.image_to_string(
+    gray = ImageOps.autocontrast(ImageOps.grayscale(rank_crop))
+    txt = pytesseract.image_to_string(
         gray,
         config="--psm 10 -c tessedit_char_whitelist=AKQJT9876543210"
     )
-    return (text or "").strip().upper()
+    txt = (txt or "").strip().upper()
+    return txt if txt else "?"
 
 
-def normalize_rank(raw: str) -> str:
-    """
-    Conservative rank normalization:
-    - Accepts raw OCR output and returns one of: A K Q J T 9..2 or "?"
-    - Converts "10" (or variants containing 10) into "T"
-    - Strips everything else
-    """
-    if not raw:
-        return "?"
+def normalize_rank(raw: Optional[str]) -> Optional[str]:
+    if raw is None:
+        return None
+    s = str(raw).strip().upper()
+    if not s or s == "?":
+        return None
 
-    s = raw.strip().upper()
+    # keep only plausible characters
+    # common OCR junk: spaces, punctuation, stray letters
+    s = "".join(ch for ch in s if ch in "AKQJT9876543210")
 
-    # Handle common multi-char ten cases first
-    # Examples: "10", "1O", "IO", "T0" (rare), extra whitespace/newlines
-    s_compact = re.sub(r"\s+", "", s)
-    s_compact = s_compact.replace("O", "0")  # treat O as 0 only for the ten check
+    if not s:
+        return None
 
-    if "10" in s_compact:
+    # handle "10" variants
+    if s == "10" or s == "1O" or s == "IO":
         return "T"
 
-    # Keep only valid rank characters
-    kept = "".join(ch for ch in s_compact if ch in RANK_WHITELIST)
+    # common confusions
+    s = s.replace("0", "O")  # if it’s actually an O
+    # but ranks don’t include O, so treat O as zero/ten-ish if paired with 1
+    if s in ("O",):
+        return None
 
-    if not kept:
-        return "?"
+    # if multiple chars survived, pick the best guess
+    # prefer face ranks if present, else first digit
+    for ch in s:
+        if ch in "AKQJT":
+            return ch
+    for ch in s:
+        if ch in "98765432":
+            return ch
 
-    # If OCR returned multiple valid chars, take the first
-    return kept[0]
+    # if it’s "1" alone, likely junk (rank isn’t 1)
+    return None
 
 
 # ----------------------------
 # API
 # ----------------------------
-
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
     opts = req.options or {}
 
+    debug = bool(opts.get("debug", False))
     max_pages = int(opts.get("max_pages_to_scan", 75))
     max_gap_pages = int(opts.get("max_gap_pages", 10))
 
-    # You can turn OCR off from the GPT call if you want
-    ocr_enabled = bool(opts.get("ocr_enabled", True))
-
-    results: List[Dict[str, Any]] = []
+    out_results: List[Dict[str, Any]] = []
+    out_errors: List[Dict[str, Any]] = []
 
     for ref in refs:
         if not isinstance(ref, dict) or "download_link" not in ref:
+            out_errors.append({"error": "bad_ref", "detail": "Each ref must be an object with download_link."})
             continue
 
-        pdf_bytes = requests.get(ref["download_link"], timeout=60).content
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        url = ref["download_link"]
 
         try:
-            pages = min(doc.page_count, max_pages)
-            timeline: List[Dict[str, Any]] = []
+            r = requests.get(url, timeout=60)
+            r.raise_for_status()
+            pdf_bytes = r.content
 
-            last_street: Optional[str] = None
-            for i in range(pages):
-                img = render_page_to_pil(doc, i)
-                board_box = board_region_box(img)
-                slot_boxes = card_slot_boxes_from_board(board_box)
+            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+            try:
+                pages = min(doc.page_count, max_pages)
 
-                slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
-                street = street_from_slots(slot_activity)
+                # Build street timeline (changes only)
+                street_timeline: List[Dict[str, Any]] = []
+                last_street: Optional[str] = None
 
-                if street != last_street:
-                    timeline.append({"page_index": i, "street": street})
-                    last_street = street
+                for i in range(pages):
+                    img = render_page_to_pil(doc, i)
+                    board_box = board_region_box(img)
+                    slot_boxes = card_slot_boxes_from_board(board_box)
 
-            # Hand windows (partial-aware)
-            hands: List[Dict[str, Any]] = []
-            current: Optional[Dict[str, Any]] = None
-            last_page: Optional[int] = None
-            hand_index = 0
+                    slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
+                    street = street_from_slots(slot_activity)
 
-            for entry in timeline:
-                p = int(entry["page_index"])
-                s = str(entry["street"])
+                    if street != last_street:
+                        street_timeline.append({"page_index": i, "street": street})
+                        last_street = street
 
-                if s == "FLOP" and current is None:
-                    hand_index += 1
-                    current = {
-                        "hand_index": hand_index,
-                        "start_page_index": p,
-                        "end_page_index": None,
-                        "partial": True,
-                    }
+                # Hand windows: start at FLOP; end when we see a PREFLOP later OR a big gap
+                hand_windows: List[Dict[str, Any]] = []
+                current = None
+                last_change_page = None
+                hand_index = 0
 
-                if current and last_page is not None and (p - last_page) > max_gap_pages:
-                    current["end_page_index"] = last_page
+                for entry in street_timeline:
+                    p = entry["page_index"]
+                    s = entry["street"]
+
+                    if s == "FLOP" and current is None:
+                        hand_index += 1
+                        current = {
+                            "hand_index": hand_index,
+                            "start_page_index": p,
+                            "end_page_index": None,
+                            "partial": True,
+                        }
+
+                    # gap rule based on *change pages*
+                    if current and last_change_page is not None and (p - last_change_page) > max_gap_pages:
+                        current["end_page_index"] = last_change_page
+                        current["partial"] = True
+                        hand_windows.append(current)
+                        current = None
+
+                    # close on a PREFLOP after we already started
+                    if s == "PREFLOP" and current is not None:
+                        current["end_page_index"] = last_change_page
+                        current["partial"] = False
+                        hand_windows.append(current)
+                        current = None
+
+                    last_change_page = p
+
+                if current is not None:
+                    current["end_page_index"] = last_change_page
                     current["partial"] = True
-                    hands.append(current)
-                    current = None
+                    hand_windows.append(current)
 
-                last_page = p
-
-            if current:
-                current["end_page_index"] = last_page
-                current["partial"] = True
-                hands.append(current)
-
-            # OCR one representative page per hand
-            ocr_results: List[Dict[str, Any]] = []
-            if ocr_enabled and hands:
-                for h in hands:
-                    # Prefer end page if present (often later street), else start page
+                # OCR ranks: one representative page per hand (prefer end_page if it exists)
+                card_rank_ocr: List[Dict[str, Any]] = []
+                for h in hand_windows:
                     candidate_pages = [h.get("end_page_index"), h.get("start_page_index")]
-                    page_idx = next((p for p in candidate_pages if isinstance(p, int)), h.get("start_page_index", 0))
+                    page_idx = next((p for p in candidate_pages if isinstance(p, int)), None)
+                    if page_idx is None:
+                        continue
 
                     img = render_page_to_pil(doc, page_idx)
                     board_box = board_region_box(img)
@@ -247,16 +270,15 @@ async def parse_poker_pdf(req: ParseRequest):
                             (name == "river" and street == "RIVER")
                         )
 
-                        if not allowed:
+                        if allowed:
+                            raw = ocr_rank_raw(rank_crop_from_slot(img, box))
+                            ranks_raw[name] = raw
+                            ranks_norm[name] = normalize_rank(raw)
+                        else:
                             ranks_raw[name] = None
                             ranks_norm[name] = None
-                            continue
 
-                        raw = ocr_rank_raw(rank_crop_from_slot(img, box))
-                        ranks_raw[name] = raw
-                        ranks_norm[name] = normalize_rank(raw)
-
-                    ocr_results.append(
+                    card_rank_ocr.append(
                         {
                             "hand_index": h["hand_index"],
                             "page_index": page_idx,
@@ -266,20 +288,39 @@ async def parse_poker_pdf(req: ParseRequest):
                         }
                     )
 
-            results.append(
-                {
-                    "street_timeline": timeline,
-                    "hand_windows": hands,
-                    "card_rank_ocr": ocr_results,
-                }
-            )
+                out_results.append(
+                    {
+                        "pages_scanned": pages,
+                        "street_timeline": street_timeline,
+                        "hand_windows": hand_windows,
+                        "card_rank_ocr": card_rank_ocr,
+                    }
+                )
 
-        finally:
-            doc.close()
+            finally:
+                doc.close()
+
+        except Exception as e:
+            err = {
+                "type": type(e).__name__,
+                "message": str(e),
+            }
+            if debug:
+                err["traceback"] = traceback.format_exc()
+                err["ref"] = {"download_link": url}
+            out_errors.append(err)
+
+    response_obj = {
+        "BUILD_ID": BUILD_ID,
+        "ocr_available": OCR_AVAILABLE,
+        "results": out_results,
+        "errors": out_errors,
+    }
 
     return {
-        "BUILD_ID": "ocr-rank-norm-v1",
-        "hand_history_text": json.dumps({"results": results}, indent=2),
-        "hands_detected": sum(len(r.get("hand_windows", [])) for r in results),
+        "hand_history_text": json.dumps(response_obj, indent=2),
+        "hands_detected": sum(len(r.get("hand_windows", [])) for r in out_results),
+        "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
+        "errors_count": len(out_errors),
     }
