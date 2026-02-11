@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Any, List, Optional, Dict
+from typing import Any, List, Optional, Dict, Tuple
 import io
 import json
 import traceback
@@ -20,7 +20,7 @@ except Exception:
 
 app = FastAPI()
 
-BUILD_ID = "ocr-rank-norm-v1"
+BUILD_ID = "ocr-rank-norm-v2"
 
 
 class ParseRequest(BaseModel):
@@ -42,12 +42,7 @@ def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> I
 # ----------------------------
 def board_region_box(img: Image.Image) -> List[int]:
     w, h = img.size
-    return [
-        int(w * 0.34),
-        int(h * 0.26),
-        int(w * 0.66),
-        int(h * 0.48),
-    ]
+    return [int(w * 0.34), int(h * 0.26), int(w * 0.66), int(h * 0.48)]
 
 
 def activity_for_box(img: Image.Image, box: List[int]) -> float:
@@ -83,15 +78,19 @@ def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
 
 
 # ----------------------------
-# Street logic
+# Street logic (thresholds configurable)
 # ----------------------------
-def street_from_slots(slot_activity: Dict[str, float]) -> str:
-    # tuned thresholds you’ve been using
-    if slot_activity.get("river", 0.0) >= 50.0:
+def street_from_slots(
+    slot_activity: Dict[str, float],
+    flop_thr: float = 20.0,
+    turn_thr: float = 50.0,
+    river_thr: float = 50.0,
+) -> str:
+    if slot_activity.get("river", 0.0) >= river_thr:
         return "RIVER"
-    if slot_activity.get("turn", 0.0) >= 50.0:
+    if slot_activity.get("turn", 0.0) >= turn_thr:
         return "TURN"
-    flop_count = sum(1 for k in ("flop1", "flop2", "flop3") if slot_activity.get(k, 0.0) >= 20.0)
+    flop_count = sum(1 for k in ("flop1", "flop2", "flop3") if slot_activity.get(k, 0.0) >= flop_thr)
     if flop_count == 3:
         return "FLOP"
     return "PREFLOP"
@@ -104,7 +103,6 @@ def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
     left, top, right, bottom = slot_box
     w = right - left
     h = bottom - top
-    # top-left corner where rank usually sits
     return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
 
 
@@ -129,24 +127,25 @@ def normalize_rank(raw: Optional[str]) -> Optional[str]:
         return None
 
     # keep only plausible characters
-    # common OCR junk: spaces, punctuation, stray letters
-    s = "".join(ch for ch in s if ch in "AKQJT9876543210")
+    s = "".join(ch for ch in s if ch in "AKQJT9876543210O")
 
     if not s:
         return None
 
-    # handle "10" variants
-    if s == "10" or s == "1O" or s == "IO":
+    # normalize common 10 forms
+    if "10" in s or s in ("IO", "1O", "I0", "1Ø"):
         return "T"
-
-    # common confusions
-    s = s.replace("0", "O")  # if it’s actually an O
-    # but ranks don’t include O, so treat O as zero/ten-ish if paired with 1
-    if s in ("O",):
+    if s == "0":
         return None
 
-    # if multiple chars survived, pick the best guess
-    # prefer face ranks if present, else first digit
+    # OCR confusions
+    # O is not a rank; treat as likely 0/10 noise unless paired above
+    s = s.replace("O", "")
+
+    if not s:
+        return None
+
+    # If multiple chars survived, pick best guess
     for ch in s:
         if ch in "AKQJT":
             return ch
@@ -154,8 +153,21 @@ def normalize_rank(raw: Optional[str]) -> Optional[str]:
         if ch in "98765432":
             return ch
 
-    # if it’s "1" alone, likely junk (rank isn’t 1)
     return None
+
+
+def ranks_expected_for_street(street: str) -> Tuple[bool, bool, bool]:
+    """
+    Returns booleans for which streets should be read:
+      (read_flop, read_turn, read_river)
+    """
+    if street == "RIVER":
+        return True, True, True
+    if street == "TURN":
+        return True, True, False
+    if street == "FLOP":
+        return True, False, False
+    return False, False, False
 
 
 # ----------------------------
@@ -170,12 +182,20 @@ async def parse_poker_pdf(req: ParseRequest):
     max_pages = int(opts.get("max_pages_to_scan", 75))
     max_gap_pages = int(opts.get("max_gap_pages", 10))
 
+    flop_thr = float(opts.get("flop_threshold", 20.0))
+    turn_thr = float(opts.get("turn_threshold", 50.0))
+    river_thr = float(opts.get("river_threshold", 50.0))
+
+    enable_timeline = bool(opts.get("timeline", True))
+    include_hand_windows = bool(opts.get("include_hand_windows", True))
+    enable_ocr = bool(opts.get("enable_ocr", True))
+
     out_results: List[Dict[str, Any]] = []
     out_errors: List[Dict[str, Any]] = []
 
     for ref in refs:
         if not isinstance(ref, dict) or "download_link" not in ref:
-            out_errors.append({"error": "bad_ref", "detail": "Each ref must be an object with download_link."})
+            out_errors.append({"type": "bad_ref", "message": "Each ref must be an object with download_link."})
             continue
 
         url = ref["download_link"]
@@ -189,108 +209,113 @@ async def parse_poker_pdf(req: ParseRequest):
             try:
                 pages = min(doc.page_count, max_pages)
 
-                # Build street timeline (changes only)
                 street_timeline: List[Dict[str, Any]] = []
-                last_street: Optional[str] = None
+                if enable_timeline:
+                    last_street: Optional[str] = None
+                    for i in range(pages):
+                        img = render_page_to_pil(doc, i)
+                        board_box = board_region_box(img)
+                        slot_boxes = card_slot_boxes_from_board(board_box)
 
-                for i in range(pages):
-                    img = render_page_to_pil(doc, i)
-                    board_box = board_region_box(img)
-                    slot_boxes = card_slot_boxes_from_board(board_box)
+                        slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
+                        street = street_from_slots(slot_activity, flop_thr, turn_thr, river_thr)
 
-                    slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
-                    street = street_from_slots(slot_activity)
+                        if street != last_street:
+                            street_timeline.append({"page_index": i, "street": street})
+                            last_street = street
 
-                    if street != last_street:
-                        street_timeline.append({"page_index": i, "street": street})
-                        last_street = street
-
-                # Hand windows: start at FLOP; end when we see a PREFLOP later OR a big gap
                 hand_windows: List[Dict[str, Any]] = []
-                current = None
-                last_change_page = None
-                hand_index = 0
+                if include_hand_windows and street_timeline:
+                    current = None
+                    last_change_page = None
+                    hand_index = 0
 
-                for entry in street_timeline:
-                    p = entry["page_index"]
-                    s = entry["street"]
+                    for entry in street_timeline:
+                        p = entry["page_index"]
+                        s = entry["street"]
 
-                    if s == "FLOP" and current is None:
-                        hand_index += 1
-                        current = {
-                            "hand_index": hand_index,
-                            "start_page_index": p,
-                            "end_page_index": None,
-                            "partial": True,
-                        }
+                        if s == "FLOP" and current is None:
+                            hand_index += 1
+                            current = {
+                                "hand_index": hand_index,
+                                "start_page_index": p,
+                                "end_page_index": None,
+                                "partial": True,
+                                "end_reason": None,
+                            }
 
-                    # gap rule based on *change pages*
-                    if current and last_change_page is not None and (p - last_change_page) > max_gap_pages:
+                        if current and last_change_page is not None and (p - last_change_page) > max_gap_pages:
+                            current["end_page_index"] = last_change_page
+                            current["partial"] = True
+                            current["end_reason"] = "gap"
+                            hand_windows.append(current)
+                            current = None
+
+                        if s == "PREFLOP" and current is not None:
+                            current["end_page_index"] = last_change_page
+                            current["partial"] = False
+                            current["end_reason"] = "returned_to_preflop"
+                            hand_windows.append(current)
+                            current = None
+
+                        last_change_page = p
+
+                    if current is not None:
                         current["end_page_index"] = last_change_page
                         current["partial"] = True
+                        current["end_reason"] = "end_of_scan"
                         hand_windows.append(current)
-                        current = None
 
-                    # close on a PREFLOP after we already started
-                    if s == "PREFLOP" and current is not None:
-                        current["end_page_index"] = last_change_page
-                        current["partial"] = False
-                        hand_windows.append(current)
-                        current = None
-
-                    last_change_page = p
-
-                if current is not None:
-                    current["end_page_index"] = last_change_page
-                    current["partial"] = True
-                    hand_windows.append(current)
-
-                # OCR ranks: one representative page per hand (prefer end_page if it exists)
+                # OCR ranks: one representative page per hand
                 card_rank_ocr: List[Dict[str, Any]] = []
-                for h in hand_windows:
-                    candidate_pages = [h.get("end_page_index"), h.get("start_page_index")]
-                    page_idx = next((p for p in candidate_pages if isinstance(p, int)), None)
-                    if page_idx is None:
-                        continue
+                if enable_ocr and hand_windows:
+                    for h in hand_windows:
+                        candidate_pages = [h.get("end_page_index"), h.get("start_page_index")]
+                        page_idx = next((p for p in candidate_pages if isinstance(p, int)), None)
+                        if page_idx is None:
+                            continue
 
-                    img = render_page_to_pil(doc, page_idx)
-                    board_box = board_region_box(img)
-                    slot_boxes = card_slot_boxes_from_board(board_box)
+                        img = render_page_to_pil(doc, page_idx)
+                        board_box = board_region_box(img)
+                        slot_boxes = card_slot_boxes_from_board(board_box)
 
-                    slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
-                    street = street_from_slots(slot_activity)
+                        slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
+                        street = street_from_slots(slot_activity, flop_thr, turn_thr, river_thr)
 
-                    ranks_raw: Dict[str, Optional[str]] = {}
-                    ranks_norm: Dict[str, Optional[str]] = {}
+                        read_flop, read_turn, read_river = ranks_expected_for_street(street)
 
-                    for name, box in slot_boxes.items():
-                        allowed = (
-                            (name.startswith("flop") and street in ("FLOP", "TURN", "RIVER")) or
-                            (name == "turn" and street in ("TURN", "RIVER")) or
-                            (name == "river" and street == "RIVER")
+                        ranks_raw: Dict[str, Optional[str]] = {}
+                        ranks_norm: Dict[str, Optional[str]] = {}
+
+                        for name, box in slot_boxes.items():
+                            allowed = (
+                                (name.startswith("flop") and read_flop) or
+                                (name == "turn" and read_turn) or
+                                (name == "river" and read_river)
+                            )
+
+                            if allowed:
+                                raw = ocr_rank_raw(rank_crop_from_slot(img, box))
+                                ranks_raw[name] = raw
+                                ranks_norm[name] = normalize_rank(raw)
+                            else:
+                                ranks_raw[name] = None
+                                ranks_norm[name] = None
+
+                        card_rank_ocr.append(
+                            {
+                                "hand_index": h["hand_index"],
+                                "page_index": page_idx,
+                                "street": street,
+                                "card_ranks_raw": ranks_raw,
+                                "card_ranks": ranks_norm,
+                            }
                         )
-
-                        if allowed:
-                            raw = ocr_rank_raw(rank_crop_from_slot(img, box))
-                            ranks_raw[name] = raw
-                            ranks_norm[name] = normalize_rank(raw)
-                        else:
-                            ranks_raw[name] = None
-                            ranks_norm[name] = None
-
-                    card_rank_ocr.append(
-                        {
-                            "hand_index": h["hand_index"],
-                            "page_index": page_idx,
-                            "street": street,
-                            "card_ranks_raw": ranks_raw,
-                            "card_ranks": ranks_norm,
-                        }
-                    )
 
                 out_results.append(
                     {
                         "pages_scanned": pages,
+                        "thresholds": {"flop": flop_thr, "turn": turn_thr, "river": river_thr},
                         "street_timeline": street_timeline,
                         "hand_windows": hand_windows,
                         "card_rank_ocr": card_rank_ocr,
@@ -301,10 +326,7 @@ async def parse_poker_pdf(req: ParseRequest):
                 doc.close()
 
         except Exception as e:
-            err = {
-                "type": type(e).__name__,
-                "message": str(e),
-            }
+            err = {"type": type(e).__name__, "message": str(e)}
             if debug:
                 err["traceback"] = traceback.format_exc()
                 err["ref"] = {"download_link": url}
@@ -318,9 +340,9 @@ async def parse_poker_pdf(req: ParseRequest):
     }
 
     return {
-        "hand_history_text": json.dumps(response_obj, indent=2),
-        "hands_detected": sum(len(r.get("hand_windows", [])) for r in out_results),
         "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
         "errors_count": len(out_errors),
+        "hands_detected": sum(len(r.get("hand_windows", [])) for r in out_results),
+        "hand_history_text": json.dumps(response_obj, indent=2),
     }
