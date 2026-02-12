@@ -5,27 +5,26 @@ from typing import Any, List, Optional, Dict, Tuple
 import io
 import json
 import traceback
+import os
 
 import requests
 import fitz  # PyMuPDF
 from PIL import Image, ImageStat, ImageOps
 
-# OCR optional (Render often won't have tesseract binary installed)
+# OCR optional
 try:
     import pytesseract  # type: ignore
-
     OCR_AVAILABLE = True
 except Exception:
     pytesseract = None
     OCR_AVAILABLE = False
 
 app = FastAPI()
-
-BUILD_ID = "ocr-rank-norm-v2"
+BUILD_ID = "ocr-rank-norm-v3"
 
 
 # ----------------------------
-# Request Models (UPDATED)
+# Request Models
 # ----------------------------
 
 class OpenAIFileRef(BaseModel):
@@ -38,206 +37,69 @@ class ParseRequest(BaseModel):
 
 
 # ----------------------------
-# Rendering
+# File Fetch Helper (NEW)
 # ----------------------------
-def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> Image.Image:
-    page = doc.load_page(page_index)
-    pix = page.get_pixmap(dpi=dpi)
-    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
+def fetch_pdf_bytes(download_link: str) -> bytes:
+    if not isinstance(download_link, str) or not download_link.strip():
+        raise ValueError("download_link must be a non-empty string")
 
-# ----------------------------
-# Geometry + activity
-# ----------------------------
-def board_region_box(img: Image.Image) -> List[int]:
-    w, h = img.size
-    return [int(w * 0.34), int(h * 0.26), int(w * 0.66), int(h * 0.48)]
+    download_link = download_link.strip()
 
+    # Case 1: Signed URL
+    if download_link.startswith("http://") or download_link.startswith("https://"):
+        r = requests.get(download_link, timeout=60)
+        r.raise_for_status()
+        return r.content
 
-def activity_for_box(img: Image.Image, box: List[int]) -> float:
-    crop = img.crop(tuple(box))
-    stat = ImageStat.Stat(crop)
-    stddev = [float(x) for x in stat.stddev]
-    return float(sum(stddev) / max(len(stddev), 1))
+    # Case 2: Local file path (tool environment)
+    if download_link.startswith("/mnt/") and os.path.exists(download_link):
+        with open(download_link, "rb") as f:
+            return f.read()
 
+    # Case 3: OpenAI file ID
+    if download_link.startswith("file-") or download_link.startswith("file_"):
+        from openai import OpenAI
+        client = OpenAI()
+        response = client.files.content(download_link)
+        return response.read()
 
-def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
-    left, top, right, bottom = board_box
-    bw = right - left
-    bh = bottom - top
-
-    pad_x = int(bw * 0.04)
-    pad_y = int(bh * 0.12)
-
-    x0 = left + pad_x
-    y0 = top + pad_y
-    x1 = right - pad_x
-    y1 = bottom - pad_y
-
-    inner_w = x1 - x0
-    gap = int(inner_w * 0.02)
-    slot_w = int((inner_w - gap * 4) / 5)
-
-    boxes: Dict[str, List[int]] = {}
-    for i, name in enumerate(["flop1", "flop2", "flop3", "turn", "river"]):
-        sx0 = x0 + i * (slot_w + gap)
-        boxes[name] = [sx0, y0, sx0 + slot_w, y1]
-
-    return boxes
-
-
-# ----------------------------
-# Street logic
-# ----------------------------
-def coerce_thresholds(opts: dict) -> Dict[str, float]:
-    default = {"flop": 20.0, "turn": 50.0, "river": 50.0}
-    raw = opts.get("slot_thresholds", default)
-
-    if isinstance(raw, dict):
-        return {
-            "flop": float(raw.get("flop", default["flop"])),
-            "turn": float(raw.get("turn", default["turn"])),
-            "river": float(raw.get("river", default["river"])),
-        }
-
-    try:
-        v = float(raw)
-        return {"flop": v, "turn": max(50.0, v), "river": max(50.0, v)}
-    except Exception:
-        return default
-
-
-def street_from_slots(slot_activity: Dict[str, float], thresholds: Dict[str, float]) -> str:
-    if float(slot_activity.get("river", 0.0)) >= float(thresholds["river"]):
-        return "RIVER"
-    if float(slot_activity.get("turn", 0.0)) >= float(thresholds["turn"]):
-        return "TURN"
-
-    flop_count = sum(
-        1
-        for k in ("flop1", "flop2", "flop3")
-        if float(slot_activity.get(k, 0.0)) >= float(thresholds["flop"])
-    )
-    if flop_count == 3:
-        return "FLOP"
-
-    return "PREFLOP"
-
-
-# ----------------------------
-# OCR (rank only) + normalization
-# ----------------------------
-def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
-    left, top, right, bottom = slot_box
-    w = right - left
-    h = bottom - top
-    return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
-
-
-def ocr_rank_raw(rank_crop: Image.Image) -> str:
-    if not OCR_AVAILABLE or pytesseract is None:
-        return "OCR_UNAVAILABLE"
-
-    gray = ImageOps.autocontrast(ImageOps.grayscale(rank_crop))
-    txt = pytesseract.image_to_string(
-        gray,
-        config="--psm 10 -c tessedit_char_whitelist=AKQJT9876543210",
-    )
-    txt = (txt or "").strip().upper()
-    return txt if txt else "?"
-
-
-def normalize_rank(raw: Optional[str]) -> Optional[str]:
-    if raw is None:
-        return None
-
-    s = str(raw).strip().upper()
-    if not s or s == "?":
-        return None
-
-    s = "".join(ch for ch in s if ch in "AKQJT9876543210IO")
-    if not s:
-        return None
-
-    if "10" in s or s in ("IO", "1O", "OI", "O1"):
-        return "T"
-
-    s = s.replace("I", "1").replace("O", "0")
-
-    for ch in s:
-        if ch in "AKQJT":
-            return ch
-
-    for ch in s:
-        if ch in "98765432":
-            return ch
-
-    return None
-
-
-def allowed_slots_for_street(street: str) -> Tuple[str, ...]:
-    if street == "RIVER":
-        return ("flop1", "flop2", "flop3", "turn", "river")
-    if street == "TURN":
-        return ("flop1", "flop2", "flop3", "turn")
-    if street == "FLOP":
-        return ("flop1", "flop2", "flop3")
-    return tuple()
+    raise ValueError(f"Unsupported download_link format: {download_link}")
 
 
 # ----------------------------
 # API
 # ----------------------------
+
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
-    refs = req.openaiFileIdRefs or []
+
     opts = req.options or {}
-
     debug = bool(opts.get("debug", False))
-    max_pages_to_scan = int(opts.get("max_pages_to_scan", 75))
-    max_gap_pages = int(opts.get("max_gap_pages", 10))
-
-    want_timeline = bool(opts.get("timeline", True))
-    want_hand_windows = bool(opts.get("include_hand_windows", True))
-    want_rank_ocr = bool(opts.get("include_rank_ocr", True))
-
-    thresholds = coerce_thresholds(opts)
 
     out_results: List[Dict[str, Any]] = []
     out_errors: List[Dict[str, Any]] = []
 
-    for ref in refs:
-        if not isinstance(ref, OpenAIFileRef):
-            out_errors.append(
-                {
-                    "type": "bad_ref",
-                    "message": "Each ref must be an object with a download_link string.",
-                }
-            )
-            continue
-
-        url = ref.download_link
-        if not isinstance(url, str) or not url.strip():
-            out_errors.append({"type": "bad_ref", "message": "download_link must be a non-empty string."})
-            continue
-
+    for ref in req.openaiFileIdRefs:
         try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            pdf_bytes = r.content
+            pdf_bytes = fetch_pdf_bytes(ref.download_link)
 
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                pages_scanned = min(int(doc.page_count), int(max_pages_to_scan))
-                out_results.append({"pages_scanned": pages_scanned})
-            finally:
-                doc.close()
+            pages_scanned = doc.page_count
+            doc.close()
+
+            out_results.append({
+                "pages_scanned": pages_scanned
+            })
 
         except Exception as e:
-            err: Dict[str, Any] = {"type": type(e).__name__, "message": str(e)}
+            err = {
+                "type": type(e).__name__,
+                "message": str(e)
+            }
             if debug:
                 err["traceback"] = traceback.format_exc()
-                err["download_link"] = url
+                err["download_link"] = ref.download_link
             out_errors.append(err)
 
     payload = {
