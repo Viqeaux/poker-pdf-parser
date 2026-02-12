@@ -1,369 +1,106 @@
-# main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-from typing import Any, List, Optional, Dict, Tuple
-import io
-import json
-import traceback
-
-import requests
-import fitz  # PyMuPDF
-from PIL import Image, ImageStat, ImageOps
-
-# OCR optional
-try:
-    import pytesseract
-    OCR_AVAILABLE = True
-except Exception:
-    pytesseract = None
-    OCR_AVAILABLE = False
-
-app = FastAPI()
-
-BUILD_ID = "ocr-rank-norm-v2"
-
-
-class ParseRequest(BaseModel):
-    openaiFileIdRefs: List[Any]
-    options: Optional[dict] = None
-
-
-# IMPORTANT: Response model so OpenAPI is valid for GPT Actions (no more {} schema).
-class ParseResponse(BaseModel):
-    BUILD_ID: str
-    ocr_available: bool
-    errors_count: int
-    hands_detected: int
-    hand_history_text: str
-
-
-# ----------------------------
-# Rendering
-# ----------------------------
-def render_page_to_pil(doc: fitz.Document, page_index: int, dpi: int = 150) -> Image.Image:
-    page = doc.load_page(page_index)
-    pix = page.get_pixmap(dpi=dpi)
-    return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
-
-
-# ----------------------------
-# Geometry + activity
-# ----------------------------
-def board_region_box(img: Image.Image) -> List[int]:
-    w, h = img.size
-    return [int(w * 0.34), int(h * 0.26), int(w * 0.66), int(h * 0.48)]
-
-
-def activity_for_box(img: Image.Image, box: List[int]) -> float:
-    crop = img.crop(tuple(box))
-    stat = ImageStat.Stat(crop)
-    stddev = [float(x) for x in stat.stddev]
-    return float(sum(stddev) / max(len(stddev), 1))
-
-
-def card_slot_boxes_from_board(board_box: List[int]) -> Dict[str, List[int]]:
-    left, top, right, bottom = board_box
-    bw = right - left
-    bh = bottom - top
-
-    pad_x = int(bw * 0.04)
-    pad_y = int(bh * 0.12)
-
-    x0 = left + pad_x
-    y0 = top + pad_y
-    x1 = right - pad_x
-    y1 = bottom - pad_y
-
-    inner_w = x1 - x0
-    gap = int(inner_w * 0.02)
-    slot_w = int((inner_w - gap * 4) / 5)
-
-    boxes: Dict[str, List[int]] = {}
-    for i, name in enumerate(["flop1", "flop2", "flop3", "turn", "river"]):
-        sx0 = x0 + i * (slot_w + gap)
-        boxes[name] = [sx0, y0, sx0 + slot_w, y1]
-
-    return boxes
-
-
-# ----------------------------
-# Street logic (thresholds configurable)
-# ----------------------------
-def street_from_slots(
-    slot_activity: Dict[str, float],
-    flop_thr: float = 20.0,
-    turn_thr: float = 50.0,
-    river_thr: float = 50.0,
-) -> str:
-    if slot_activity.get("river", 0.0) >= river_thr:
-        return "RIVER"
-    if slot_activity.get("turn", 0.0) >= turn_thr:
-        return "TURN"
-    flop_count = sum(1 for k in ("flop1", "flop2", "flop3") if slot_activity.get(k, 0.0) >= flop_thr)
-    if flop_count == 3:
-        return "FLOP"
-    return "PREFLOP"
-
-
-# ----------------------------
-# OCR (rank only) + normalization
-# ----------------------------
-def rank_crop_from_slot(img: Image.Image, slot_box: List[int]) -> Image.Image:
-    left, top, right, bottom = slot_box
-    w = right - left
-    h = bottom - top
-    return img.crop((left, top, left + int(w * 0.35), top + int(h * 0.35)))
-
-
-def ocr_rank_raw(rank_crop: Image.Image) -> str:
-    if not OCR_AVAILABLE or pytesseract is None:
-        return "OCR_UNAVAILABLE"
-
-    gray = ImageOps.autocontrast(ImageOps.grayscale(rank_crop))
-    txt = pytesseract.image_to_string(
-        gray,
-        config="--psm 10 -c tessedit_char_whitelist=AKQJT9876543210"
-    )
-    txt = (txt or "").strip().upper()
-    return txt if txt else "?"
-
-
-def normalize_rank(raw: Optional[str]) -> Optional[str]:
-    """
-    Normalize OCR output to a single rank char:
-      A K Q J T 9 8 7 6 5 4 3 2
-    Returns None if unknown/unreliable.
-    """
-    if raw is None:
-        return None
-    s = str(raw).strip().upper()
-    if not s or s == "?":
-        return None
-
-    # Keep only plausible characters, including common OCR mistakes we want to detect.
-    s = "".join(ch for ch in s if ch in "AKQJT9876543210OI")
-
-    if not s:
-        return None
-
-    # Normalize "10" and common OCR variants (IO, 1O, I0)
-    if "10" in s or s in ("IO", "1O", "I0"):
-        return "T"
-
-    # Remove characters that can't be ranks but appear from OCR.
-    # 'O' is not a rank; treat as noise unless it was part of 10 above.
-    s = s.replace("O", "")
-    # 'I' can look like '1' or 'T'; treat as noise unless it was part of 10 above.
-    s = s.replace("I", "")
-
-    # Drop '1' and '0' leftovers (no rank 1; 0 only for 10 handled above).
-    s = s.replace("1", "").replace("0", "")
-
-    if not s:
-        return None
-
-    # If multiple chars survived, pick the best guess.
-    for ch in s:
-        if ch in "AKQJT":
-            return ch
-    for ch in s:
-        if ch in "98765432":
-            return ch
-
-    return None
-
-
-def ranks_expected_for_street(street: str) -> Tuple[bool, bool, bool]:
-    """
-    Returns booleans for which streets should be read:
-      (read_flop, read_turn, read_river)
-    """
-    if street == "RIVER":
-        return True, True, True
-    if street == "TURN":
-        return True, True, False
-    if street == "FLOP":
-        return True, False, False
-    return False, False, False
-
-
-# ----------------------------
-# API
-# ----------------------------
-@app.post("/parse_poker_pdf", response_model=ParseResponse)
-async def parse_poker_pdf(req: ParseRequest):
-    refs = req.openaiFileIdRefs or []
-    opts = req.options or {}
-
-    debug = bool(opts.get("debug", False))
-    max_pages = int(opts.get("max_pages_to_scan", 75))
-    max_gap_pages = int(opts.get("max_gap_pages", 10))
-
-    flop_thr = float(opts.get("flop_threshold", 20.0))
-    turn_thr = float(opts.get("turn_threshold", 50.0))
-    river_thr = float(opts.get("river_threshold", 50.0))
-
-    enable_timeline = bool(opts.get("timeline", True))
-    include_hand_windows = bool(opts.get("include_hand_windows", True))
-    enable_ocr = bool(opts.get("enable_ocr", True))
-
-    out_results: List[Dict[str, Any]] = []
-    out_errors: List[Dict[str, Any]] = []
-
-    for ref in refs:
-        if not isinstance(ref, dict) or "download_link" not in ref:
-            out_errors.append({"type": "bad_ref", "message": "Each ref must be an object with download_link."})
-            continue
-
-        url = ref["download_link"]
-
-        try:
-            r = requests.get(url, timeout=60)
-            r.raise_for_status()
-            pdf_bytes = r.content
-
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            try:
-                pages = min(doc.page_count, max_pages)
-
-                street_timeline: List[Dict[str, Any]] = []
-                if enable_timeline:
-                    last_street: Optional[str] = None
-                    for i in range(pages):
-                        img = render_page_to_pil(doc, i)
-                        board_box = board_region_box(img)
-                        slot_boxes = card_slot_boxes_from_board(board_box)
-
-                        slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
-                        street = street_from_slots(slot_activity, flop_thr, turn_thr, river_thr)
-
-                        if street != last_street:
-                            street_timeline.append({"page_index": i, "street": street})
-                            last_street = street
-
-                hand_windows: List[Dict[str, Any]] = []
-                if include_hand_windows and street_timeline:
-                    current = None
-                    last_change_page = None
-                    hand_index = 0
-
-                    for entry in street_timeline:
-                        p = entry["page_index"]
-                        s = entry["street"]
-
-                        if s == "FLOP" and current is None:
-                            hand_index += 1
-                            current = {
-                                "hand_index": hand_index,
-                                "start_page_index": p,
-                                "end_page_index": None,
-                                "partial": True,
-                                "end_reason": None,
-                            }
-
-                        # End due to large gap between *change pages*
-                        if current and last_change_page is not None and (p - last_change_page) > max_gap_pages:
-                            current["end_page_index"] = last_change_page
-                            current["partial"] = True
-                            current["end_reason"] = "gap"
-                            hand_windows.append(current)
-                            current = None
-
-                        # End when we return to PREFLOP after a hand started
-                        if s == "PREFLOP" and current is not None:
-                            current["end_page_index"] = last_change_page
-                            current["partial"] = False
-                            current["end_reason"] = "returned_to_preflop"
-                            hand_windows.append(current)
-                            current = None
-
-                        last_change_page = p
-
-                    # Still open at end-of-scan
-                    if current is not None:
-                        current["end_page_index"] = last_change_page
-                        current["partial"] = True
-                        current["end_reason"] = "end_of_scan"
-                        hand_windows.append(current)
-
-                # OCR ranks: one representative page per hand
-                card_rank_ocr: List[Dict[str, Any]] = []
-                if enable_ocr and hand_windows:
-                    for h in hand_windows:
-                        candidate_pages = [h.get("end_page_index"), h.get("start_page_index")]
-                        page_idx = next((p for p in candidate_pages if isinstance(p, int)), None)
-                        if page_idx is None:
-                            continue
-
-                        img = render_page_to_pil(doc, page_idx)
-                        board_box = board_region_box(img)
-                        slot_boxes = card_slot_boxes_from_board(board_box)
-
-                        slot_activity = {name: activity_for_box(img, box) for name, box in slot_boxes.items()}
-                        street = street_from_slots(slot_activity, flop_thr, turn_thr, river_thr)
-
-                        read_flop, read_turn, read_river = ranks_expected_for_street(street)
-
-                        ranks_raw: Dict[str, Optional[str]] = {}
-                        ranks_norm: Dict[str, Optional[str]] = {}
-
-                        for name, box in slot_boxes.items():
-                            allowed = (
-                                (name.startswith("flop") and read_flop) or
-                                (name == "turn" and read_turn) or
-                                (name == "river" and read_river)
-                            )
-
-                            if allowed:
-                                raw = ocr_rank_raw(rank_crop_from_slot(img, box))
-                                ranks_raw[name] = raw
-                                ranks_norm[name] = normalize_rank(raw)
-                            else:
-                                ranks_raw[name] = None
-                                ranks_norm[name] = None
-
-                        card_rank_ocr.append(
-                            {
-                                "hand_index": h["hand_index"],
-                                "page_index": page_idx,
-                                "street": street,
-                                "card_ranks_raw": ranks_raw,
-                                "card_ranks": ranks_norm,
-                            }
-                        )
-
-                out_results.append(
-                    {
-                        "pages_scanned": pages,
-                        "thresholds": {"flop": flop_thr, "turn": turn_thr, "river": river_thr},
-                        "street_timeline": street_timeline,
-                        "hand_windows": hand_windows,
-                        "card_rank_ocr": card_rank_ocr,
-                    }
-                )
-
-            finally:
-                doc.close()
-
-        except Exception as e:
-            err = {"type": type(e).__name__, "message": str(e)}
-            if debug:
-                err["traceback"] = traceback.format_exc()
-                err["ref"] = {"download_link": url}
-            out_errors.append(err)
-
-    response_obj = {
-        "BUILD_ID": BUILD_ID,
-        "ocr_available": OCR_AVAILABLE,
-        "results": out_results,
-        "errors": out_errors,
+{
+  "openapi": "3.1.0",
+  "servers": [{ "url": "https://poker-pdf-parser.onrender.com" }],
+  "info": { "title": "Poker PDF Parser", "version": "0.3.0" },
+  "paths": {
+    "/parse_poker_pdf": {
+      "post": {
+        "summary": "Parse Poker PDF",
+        "operationId": "parse_poker_pdf",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ParseRequest" }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/ParseResponse" }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/HTTPValidationError" }
+              }
+            }
+          }
+        }
+      }
     }
-
-    # Return fields that match ParseResponse, so OpenAPI shows real properties (Actions-friendly).
-    return {
-        "BUILD_ID": BUILD_ID,
-        "ocr_available": OCR_AVAILABLE,
-        "errors_count": len(out_errors),
-        "hands_detected": sum(len(r.get("hand_windows", [])) for r in out_results),
-        "hand_history_text": json.dumps(response_obj, indent=2),
+  },
+  "components": {
+    "schemas": {
+      "OpenAIFileRef": {
+        "description": "Either an object containing download_link (preferred) or a string (URL or mistaken file_...).",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "download_link": { "type": "string" }
+            },
+            "required": ["download_link"],
+            "additionalProperties": true
+          },
+          { "type": "string" }
+        ]
+      },
+      "ParseRequest": {
+        "type": "object",
+        "required": ["openaiFileIdRefs"],
+        "properties": {
+          "openaiFileIdRefs": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/OpenAIFileRef" }
+          },
+          "options": {
+            "type": ["object", "null"],
+            "default": null,
+            "additionalProperties": true
+          }
+        },
+        "additionalProperties": false
+      },
+      "ParseResponse": {
+        "type": "object",
+        "required": ["hand_history_text", "hands_detected", "BUILD_ID", "ocr_available", "errors_count"],
+        "properties": {
+          "BUILD_ID": { "type": "string" },
+          "ocr_available": { "type": "boolean" },
+          "errors_count": { "type": "integer" },
+          "hands_detected": { "type": "integer" },
+          "hand_history_text": { "type": "string" }
+        },
+        "additionalProperties": true
+      },
+      "HTTPValidationError": {
+        "type": "object",
+        "properties": {
+          "detail": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ValidationError" }
+          }
+        }
+      },
+      "ValidationError": {
+        "type": "object",
+        "required": ["loc", "msg", "type"],
+        "properties": {
+          "loc": {
+            "type": "array",
+            "items": { "anyOf": [{ "type": "string" }, { "type": "integer" }] }
+          },
+          "msg": { "type": "string" },
+          "type": { "type": "string" }
+        }
+      }
     }
+  }
+}
