@@ -35,7 +35,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v2"
+BUILD_ID = "json-engine-v2.1"
+
+
+# --------------------------------------------------
+# 🔥 HEALTH ENDPOINT (CRITICAL FOR GPT ACTIONS)
+# --------------------------------------------------
+
+@app.get("/")
+async def root():
+    return {"status": "ok"}
 
 
 # --------------------------------------------------
@@ -104,7 +113,7 @@ def ocr_digits(img):
 
 
 # --------------------------------------------------
-# Geometry
+# Geometry Helpers
 # --------------------------------------------------
 
 def polar(cx, cy, r, deg):
@@ -159,13 +168,16 @@ def extract_frame_state(image):
 
 
 # --------------------------------------------------
-# Blind + Ante Detection
+# Blind + Ante Detection (Tolerant Mode)
 # --------------------------------------------------
 
 def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
 
-    prev_seats = prev_state["seats"]
-    curr_seats = curr_state["seats"]
+    if not prev_state:
+        return None
+
+    prev_seats = prev_state.get("seats", {})
+    curr_seats = curr_state.get("seats", {})
 
     deltas = []
 
@@ -182,48 +194,37 @@ def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
         return None
 
     deltas.sort()
-
-    # Smallest delta = ante
-    ante = deltas[0]
-
-    # Next unique delta larger than ante = SB
     unique_deltas = sorted(set(deltas))
 
     if len(unique_deltas) < 3:
         return None
 
+    ante = unique_deltas[0]
     sb = unique_deltas[1]
     bb = unique_deltas[2]
 
     player_count = len(curr_seats)
-
     expected_pot = (ante * player_count) + sb + bb
+    actual_pot = curr_state.get("pot", 0)
 
-    actual_pot = curr_state["pot"]
-
-    if abs(expected_pot - actual_pot) <= tolerance:
-        return {
-            "ante": ante,
-            "small_blind": sb,
-            "big_blind": bb,
-            "players": player_count
-        }
-
-    # Tolerant fallback
-    return {
+    result = {
         "ante": ante,
         "small_blind": sb,
         "big_blind": bb,
-        "players": player_count,
-        "pot_warning": {
+        "players": player_count
+    }
+
+    if abs(expected_pot - actual_pot) > tolerance:
+        result["pot_warning"] = {
             "expected": expected_pot,
             "actual": actual_pot
         }
-    }
+
+    return result
 
 
 # --------------------------------------------------
-# API
+# API Endpoint
 # --------------------------------------------------
 
 @app.post("/parse_poker_pdf")
@@ -258,16 +259,14 @@ async def parse_poker_pdf(req: ParseRequest):
 
             for state in frames:
 
-                # Detect new hand when pot resets
+                # New hand detection via pot reset
                 if prev_state and prev_state["pot"] > 0 and state["pot"] == 0:
                     prev_state = None
                     continue
 
-                # First non-zero pot frame = blind frame
+                # Detect blind frame
                 if prev_state and prev_state["pot"] == 0 and state["pot"] > 0:
-
                     blind_info = detect_blinds_and_antes(prev_state, state)
-
                     if blind_info:
                         hands.append({
                             "blind_structure": blind_info,
@@ -285,9 +284,14 @@ async def parse_poker_pdf(req: ParseRequest):
             })
 
         except Exception as e:
-            err = {"type": type(e).__name__, "message": str(e)}
+            err = {
+                "type": type(e).__name__,
+                "message": str(e)
+            }
+
             if debug:
                 err["traceback"] = traceback.format_exc()
+
             errors.append(err)
 
     payload = {
