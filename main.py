@@ -1,5 +1,6 @@
 # main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, List, Optional, Dict
 import io
@@ -9,7 +10,6 @@ import os
 
 import requests
 import fitz  # PyMuPDF
-from PIL import Image
 
 # OCR optional
 try:
@@ -19,19 +19,33 @@ except Exception:
     pytesseract = None
     OCR_AVAILABLE = False
 
+# ----------------------------
+# App Setup
+# ----------------------------
+
 app = FastAPI()
-BUILD_ID = "ocr-rank-norm-v4"
+
+# 🔥 REQUIRED FOR GPT ACTIONS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+BUILD_ID = "production-v5"
 
 
 # ----------------------------
-# Request Models (ALLOW EXTRAS)
+# Request Models
 # ----------------------------
 
 class OpenAIFileRef(BaseModel):
     download_link: str
 
     class Config:
-        extra = "allow"   # 🔥 critical for GPT bridge
+        extra = "allow"  # critical for GPT bridge
 
 
 class ParseRequest(BaseModel):
@@ -39,7 +53,7 @@ class ParseRequest(BaseModel):
     options: Optional[Dict[str, Any]] = None
 
     class Config:
-        extra = "allow"   # 🔥 critical for GPT bridge
+        extra = "allow"  # critical for GPT bridge
 
 
 # ----------------------------
@@ -52,18 +66,18 @@ def fetch_pdf_bytes(download_link: str) -> bytes:
 
     download_link = download_link.strip()
 
-    # Case 1: Signed URL (GPT Actions production)
+    # Case 1: Signed URL from GPT Actions (production case)
     if download_link.startswith("http://") or download_link.startswith("https://"):
         r = requests.get(download_link, timeout=60)
         r.raise_for_status()
         return r.content
 
-    # Case 2: Local file path (tool runtime)
+    # Case 2: Local path (rare tool runtime case)
     if download_link.startswith("/mnt/") and os.path.exists(download_link):
         with open(download_link, "rb") as f:
             return f.read()
 
-    # Case 3: OpenAI file ID (file-xxxx)
+    # Case 3: OpenAI file ID
     if download_link.startswith("file-") or download_link.startswith("file_"):
         from openai import OpenAI
         client = OpenAI()
