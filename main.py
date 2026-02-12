@@ -8,6 +8,7 @@ import json
 import traceback
 import math
 import io
+import os
 
 import requests
 import fitz
@@ -35,11 +36,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v4-minimal"
+BUILD_ID = "json-engine-v4.1-mnt-supported"
 
 
 # --------------------------------------------------
-# Health Endpoint (REQUIRED)
+# Health Endpoint (REQUIRED FOR GPT ACTIONS)
 # --------------------------------------------------
 
 @app.get("/")
@@ -60,7 +61,7 @@ class ParseRequest(BaseModel):
 
 
 # --------------------------------------------------
-# File Download
+# File Download (PRODUCTION + GPT RUNTIME SAFE)
 # --------------------------------------------------
 
 def fetch_pdf_bytes(file_url: str) -> bytes:
@@ -69,12 +70,18 @@ def fetch_pdf_bytes(file_url: str) -> bytes:
 
     file_url = file_url.strip()
 
-    if not file_url.startswith("http"):
-        raise ValueError(f"Unsupported file_url format: {file_url}")
+    # Case 1: Signed HTTPS URL (production)
+    if file_url.startswith("http"):
+        r = requests.get(file_url, timeout=60)
+        r.raise_for_status()
+        return r.content
 
-    r = requests.get(file_url, timeout=60)
-    r.raise_for_status()
-    return r.content
+    # Case 2: GPT runtime local mount (/mnt/data/...)
+    if file_url.startswith("/mnt/") and os.path.exists(file_url):
+        with open(file_url, "rb") as f:
+            return f.read()
+
+    raise ValueError(f"Unsupported file_url format: {file_url}")
 
 
 # --------------------------------------------------
@@ -161,7 +168,7 @@ def extract_frame_state(image: Image.Image):
 
 
 # --------------------------------------------------
-# Endpoint
+# Main Endpoint
 # --------------------------------------------------
 
 @app.post("/parse_poker_pdf")
