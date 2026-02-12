@@ -3,10 +3,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import json
 import traceback
 import io
+import os
 
 import requests
 import fitz
@@ -20,10 +21,6 @@ except Exception:
     OCR_AVAILABLE = False
 
 
-# --------------------------------------------------
-# App Setup
-# --------------------------------------------------
-
 app = FastAPI()
 
 app.add_middleware(
@@ -34,58 +31,42 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v5-stable-https-only"
+BUILD_ID = "json-engine-v6-runtime-compatible"
 
-
-# --------------------------------------------------
-# Health Endpoint
-# --------------------------------------------------
 
 @app.get("/")
 async def root():
     return {"status": "ok"}
 
 
-# --------------------------------------------------
-# Request Models
-# --------------------------------------------------
-
-class OpenAIFileRef(BaseModel):
-    download_link: str
-
-    class Config:
-        extra = "allow"
-
-
 class ParseRequest(BaseModel):
-    openaiFileIdRefs: List[OpenAIFileRef]
+    file_url: str
     options: Optional[Dict[str, Any]] = None
 
     class Config:
         extra = "allow"
 
 
-# --------------------------------------------------
-# File Download (HTTPS ONLY)
-# --------------------------------------------------
+def fetch_pdf_bytes(file_url: str) -> bytes:
 
-def fetch_pdf_bytes(download_link: str) -> bytes:
-    if not isinstance(download_link, str):
-        raise ValueError("download_link must be a string")
+    if not isinstance(file_url, str):
+        raise ValueError("file_url must be a string")
 
-    download_link = download_link.strip()
+    file_url = file_url.strip()
 
-    if not download_link.startswith("http"):
-        raise ValueError(f"Invalid download_link (expected signed HTTPS URL): {download_link}")
+    # Case 1: GPT runtime local mount
+    if file_url.startswith("/mnt/") and os.path.exists(file_url):
+        with open(file_url, "rb") as f:
+            return f.read()
 
-    r = requests.get(download_link, timeout=60)
-    r.raise_for_status()
-    return r.content
+    # Case 2: Signed HTTPS URL
+    if file_url.startswith("http"):
+        r = requests.get(file_url, timeout=60)
+        r.raise_for_status()
+        return r.content
 
+    raise ValueError(f"Unsupported file_url format: {file_url}")
 
-# --------------------------------------------------
-# OCR Helpers
-# --------------------------------------------------
 
 def ocr_digits(img: Image.Image):
     if not OCR_AVAILABLE:
@@ -107,10 +88,6 @@ def ocr_digits(img: Image.Image):
         return None
 
 
-# --------------------------------------------------
-# Frame Extraction (Minimal Engine)
-# --------------------------------------------------
-
 def extract_frame_state(image: Image.Image):
 
     w, h = image.size
@@ -127,14 +104,8 @@ def extract_frame_state(image: Image.Image):
     except:
         pot = 0
 
-    return {
-        "pot": pot
-    }
+    return {"pot": pot}
 
-
-# --------------------------------------------------
-# Main Endpoint
-# --------------------------------------------------
 
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
@@ -146,44 +117,34 @@ async def parse_poker_pdf(req: ParseRequest):
 
     try:
 
-        for ref in req.openaiFileIdRefs:
+        pdf_bytes = fetch_pdf_bytes(req.file_url)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-            try:
-                pdf_bytes = fetch_pdf_bytes(ref.download_link)
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        frames = []
 
-                frames = []
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=150)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
-                for i in range(doc.page_count):
-                    page = doc.load_page(i)
-                    pix = page.get_pixmap(dpi=150)
-                    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+            state = extract_frame_state(img)
+            frames.append(state)
 
-                    state = extract_frame_state(img)
-                    frames.append(state)
+        doc.close()
 
-                doc.close()
-
-                results.append({
-                    "pages_scanned": len(frames),
-                    "frames": frames
-                })
-
-            except Exception as inner_e:
-                err = {
-                    "type": type(inner_e).__name__,
-                    "message": str(inner_e)
-                }
-                if debug:
-                    err["traceback"] = traceback.format_exc()
-                errors.append(err)
-
-    except Exception as outer_e:
-        errors.append({
-            "type": type(outer_e).__name__,
-            "message": str(outer_e),
-            "traceback": traceback.format_exc()
+        results.append({
+            "pages_scanned": len(frames),
+            "frames": frames
         })
+
+    except Exception as e:
+        err = {
+            "type": type(e).__name__,
+            "message": str(e)
+        }
+        if debug:
+            err["traceback"] = traceback.format_exc()
+        errors.append(err)
 
     payload = {
         "BUILD_ID": BUILD_ID,
