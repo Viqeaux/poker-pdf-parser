@@ -3,10 +3,9 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+from typing import Optional, Dict, Any
 import json
 import traceback
-import os
 import math
 import io
 
@@ -36,11 +35,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v3-stable"
+BUILD_ID = "json-engine-v4-minimal"
 
 
 # --------------------------------------------------
-# Health Endpoint (REQUIRED FOR GPT ACTIONS)
+# Health Endpoint (REQUIRED)
 # --------------------------------------------------
 
 @app.get("/")
@@ -49,18 +48,11 @@ async def root():
 
 
 # --------------------------------------------------
-# Request Models
+# Request Model (SIMPLIFIED)
 # --------------------------------------------------
 
-class OpenAIFileRef(BaseModel):
-    download_link: str
-
-    class Config:
-        extra = "allow"
-
-
 class ParseRequest(BaseModel):
-    openaiFileIdRefs: List[OpenAIFileRef]
+    file_url: str
     options: Optional[Dict[str, Any]] = None
 
     class Config:
@@ -68,23 +60,19 @@ class ParseRequest(BaseModel):
 
 
 # --------------------------------------------------
-# File Download (SAFE VERSION)
+# File Download
 # --------------------------------------------------
 
-def fetch_pdf_bytes(download_link: str) -> bytes:
-    """
-    GPT Actions provides a signed HTTPS URL.
-    We download it directly.
-    """
-    if not isinstance(download_link, str):
-        raise ValueError("download_link must be a string")
+def fetch_pdf_bytes(file_url: str) -> bytes:
+    if not isinstance(file_url, str):
+        raise ValueError("file_url must be a string")
 
-    download_link = download_link.strip()
+    file_url = file_url.strip()
 
-    if not download_link.startswith("http"):
-        raise ValueError(f"Unsupported download_link format: {download_link}")
+    if not file_url.startswith("http"):
+        raise ValueError(f"Unsupported file_url format: {file_url}")
 
-    r = requests.get(download_link, timeout=60)
+    r = requests.get(file_url, timeout=60)
     r.raise_for_status()
     return r.content
 
@@ -93,7 +81,7 @@ def fetch_pdf_bytes(download_link: str) -> bytes:
 # OCR Helpers
 # --------------------------------------------------
 
-def ocr_digits(img: Image.Image) -> Optional[int]:
+def ocr_digits(img: Image.Image):
     if not OCR_AVAILABLE:
         return None
 
@@ -109,12 +97,12 @@ def ocr_digits(img: Image.Image) -> Optional[int]:
 
     try:
         return int(cleaned)
-    except Exception:
+    except:
         return None
 
 
 # --------------------------------------------------
-# Geometry
+# Geometry Helpers
 # --------------------------------------------------
 
 def polar(cx, cy, r, deg):
@@ -148,7 +136,7 @@ def extract_frame_state(image: Image.Image):
 
         try:
             stack = ocr_digits(image.crop(stack_box))
-        except Exception:
+        except:
             stack = None
 
         if stack and stack > 0:
@@ -163,7 +151,7 @@ def extract_frame_state(image: Image.Image):
 
     try:
         pot = ocr_digits(image.crop(pot_box)) or 0
-    except Exception:
+    except:
         pot = 0
 
     return {
@@ -173,141 +161,50 @@ def extract_frame_state(image: Image.Image):
 
 
 # --------------------------------------------------
-# Blind + Ante Detection (Defensive)
-# --------------------------------------------------
-
-def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
-
-    if not prev_state:
-        return None
-
-    prev_seats = prev_state.get("seats", {})
-    curr_seats = curr_state.get("seats", {})
-
-    deltas = []
-
-    for seat, curr in curr_seats.items():
-        prev = prev_seats.get(seat)
-        if not prev:
-            continue
-
-        try:
-            delta = prev["stack"] - curr["stack"]
-            if delta > 0:
-                deltas.append(delta)
-        except Exception:
-            continue
-
-    if len(deltas) < 3:
-        return None
-
-    deltas.sort()
-    unique_deltas = sorted(set(deltas))
-
-    if len(unique_deltas) < 3:
-        return None
-
-    ante = unique_deltas[0]
-    sb = unique_deltas[1]
-    bb = unique_deltas[2]
-
-    player_count = len(curr_seats)
-    expected_pot = (ante * player_count) + sb + bb
-    actual_pot = curr_state.get("pot", 0)
-
-    result = {
-        "ante": ante,
-        "small_blind": sb,
-        "big_blind": bb,
-        "players": player_count
-    }
-
-    if abs(expected_pot - actual_pot) > tolerance:
-        result["pot_warning"] = {
-            "expected": expected_pot,
-            "actual": actual_pot
-        }
-
-    return result
-
-
-# --------------------------------------------------
-# Main Endpoint
+# Endpoint
 # --------------------------------------------------
 
 @app.post("/parse_poker_pdf")
 async def parse_poker_pdf(req: ParseRequest):
 
-    opts = req.options or {}
-    debug = bool(opts.get("debug", False))
+    debug = False
+    if req.options:
+        debug = bool(req.options.get("debug", False))
 
     results = []
     errors = []
 
     try:
+        pdf_bytes = fetch_pdf_bytes(req.file_url)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-        for ref in req.openaiFileIdRefs:
+        frames = []
 
-            try:
-                pdf_bytes = fetch_pdf_bytes(ref.download_link)
-                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for i in range(doc.page_count):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(dpi=150)
+            img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
-                frames = []
+            state = extract_frame_state(img)
+            frames.append(state)
 
-                for i in range(doc.page_count):
-                    page = doc.load_page(i)
-                    pix = page.get_pixmap(dpi=150)
-                    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+        doc.close()
 
-                    state = extract_frame_state(img)
-                    frames.append(state)
-
-                doc.close()
-
-                hands = []
-                prev_state = None
-
-                for state in frames:
-
-                    # Detect new hand by pot reset
-                    if prev_state and prev_state.get("pot", 0) > 0 and state.get("pot", 0) == 0:
-                        prev_state = None
-                        continue
-
-                    # Detect blind frame
-                    if prev_state and prev_state.get("pot", 0) == 0 and state.get("pot", 0) > 0:
-                        blind_info = detect_blinds_and_antes(prev_state, state)
-                        if blind_info:
-                            hands.append({
-                                "blind_structure": blind_info,
-                                "frames": []
-                            })
-
-                    if hands:
-                        hands[-1]["frames"].append(state)
-
-                    prev_state = state
-
-                results.append({
-                    "hands_detected": len(hands),
-                    "hands": hands
-                })
-
-            except Exception as inner_e:
-                err = {
-                    "type": type(inner_e).__name__,
-                    "message": str(inner_e)
-                }
-                if debug:
-                    err["traceback"] = traceback.format_exc()
-                errors.append(err)
-
-    except Exception as outer_e:
-        errors.append({
-            "type": type(outer_e).__name__,
-            "message": str(outer_e),
-            "traceback": traceback.format_exc()
+        results.append({
+            "pages_scanned": len(frames),
+            "frames": frames
         })
+
+    except Exception as e:
+        err = {
+            "type": type(e).__name__,
+            "message": str(e)
+        }
+
+        if debug:
+            err["traceback"] = traceback.format_exc()
+
+        errors.append(err)
 
     payload = {
         "BUILD_ID": BUILD_ID,
@@ -320,6 +217,6 @@ async def parse_poker_pdf(req: ParseRequest):
         "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
         "errors_count": len(errors),
-        "hands_detected": sum(r.get("hands_detected", 0) for r in results),
+        "hands_detected": 0,
         "hand_history_text": json.dumps(payload, indent=2)
     }
