@@ -8,7 +8,6 @@ import traceback
 import os
 import math
 import io
-import re
 
 import requests
 import fitz
@@ -36,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v1"
+BUILD_ID = "json-engine-v2"
 
 
 # --------------------------------------------------
@@ -104,22 +103,6 @@ def ocr_digits(img):
         return None
 
 
-def ocr_rank(img):
-    if not OCR_AVAILABLE:
-        return None
-
-    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
-    text = pytesseract.image_to_string(
-        gray,
-        config="--psm 10 -c tessedit_char_whitelist=AKQJT98765432"
-    )
-
-    text = text.strip().upper()
-    if text in list("AKQJT98765432"):
-        return text
-    return None
-
-
 # --------------------------------------------------
 # Geometry
 # --------------------------------------------------
@@ -140,7 +123,6 @@ def extract_frame_state(image):
 
     seats = {}
 
-    # --- Seats + Stacks ---
     for idx, angle in enumerate(seat_angles):
         sx, sy = polar(cx, cy, radius, angle)
 
@@ -158,80 +140,86 @@ def extract_frame_state(image):
 
         if stack and stack > 0:
             seats[idx + 1] = {
-                "stack": stack,
-                "bet": 0
+                "stack": stack
             }
 
-    # --- Pot ---
     pot_box = (
         int(w * 0.45),
         int(h * 0.32),
         int(w * 0.55),
         int(h * 0.38)
     )
-    pot = ocr_digits(image.crop(pot_box))
 
-    # --- Board (rank only) ---
-    board = []
-    board_box = (
-        int(w * 0.34),
-        int(h * 0.26),
-        int(w * 0.66),
-        int(h * 0.48)
-    )
-
-    bw = board_box[2] - board_box[0]
-    slot_w = bw // 5
-
-    for i in range(5):
-        slot = (
-            board_box[0] + i * slot_w,
-            board_box[1],
-            board_box[0] + (i + 1) * slot_w,
-            board_box[3]
-        )
-        rank_crop = image.crop(slot)
-        rank = ocr_rank(rank_crop)
-        if rank:
-            board.append(rank)
+    pot = ocr_digits(image.crop(pot_box)) or 0
 
     return {
         "seats": seats,
-        "pot": pot or 0,
-        "board": board
+        "pot": pot
     }
 
 
 # --------------------------------------------------
-# Frame Differencing
+# Blind + Ante Detection
 # --------------------------------------------------
 
-def infer_actions(prev_state, curr_state):
-
-    actions = []
-
-    if not prev_state:
-        return actions
+def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
 
     prev_seats = prev_state["seats"]
     curr_seats = curr_state["seats"]
 
+    deltas = []
+
     for seat, curr in curr_seats.items():
         prev = prev_seats.get(seat)
-
         if not prev:
             continue
 
-        stack_delta = prev["stack"] - curr["stack"]
+        delta = prev["stack"] - curr["stack"]
+        if delta > 0:
+            deltas.append(delta)
 
-        if stack_delta > 0:
-            actions.append({
-                "seat": seat,
-                "action": "bet_or_call",
-                "amount": stack_delta
-            })
+    if not deltas:
+        return None
 
-    return actions
+    deltas.sort()
+
+    # Smallest delta = ante
+    ante = deltas[0]
+
+    # Next unique delta larger than ante = SB
+    unique_deltas = sorted(set(deltas))
+
+    if len(unique_deltas) < 3:
+        return None
+
+    sb = unique_deltas[1]
+    bb = unique_deltas[2]
+
+    player_count = len(curr_seats)
+
+    expected_pot = (ante * player_count) + sb + bb
+
+    actual_pot = curr_state["pot"]
+
+    if abs(expected_pot - actual_pot) <= tolerance:
+        return {
+            "ante": ante,
+            "small_blind": sb,
+            "big_blind": bb,
+            "players": player_count
+        }
+
+    # Tolerant fallback
+    return {
+        "ante": ante,
+        "small_blind": sb,
+        "big_blind": bb,
+        "players": player_count,
+        "pot_warning": {
+            "expected": expected_pot,
+            "actual": actual_pot
+        }
+    }
 
 
 # --------------------------------------------------
@@ -251,8 +239,8 @@ async def parse_poker_pdf(req: ParseRequest):
 
         try:
             pdf_bytes = fetch_pdf_bytes(ref.download_link)
-
             doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
             frames = []
 
             for i in range(doc.page_count):
@@ -265,33 +253,31 @@ async def parse_poker_pdf(req: ParseRequest):
 
             doc.close()
 
-            # --- Build Hands ---
             hands = []
-            current_hand = {
-                "actions": [],
-                "frames": []
-            }
-
             prev_state = None
 
             for state in frames:
 
-                actions = infer_actions(prev_state, state)
+                # Detect new hand when pot resets
+                if prev_state and prev_state["pot"] > 0 and state["pot"] == 0:
+                    prev_state = None
+                    continue
 
-                if state["pot"] == 0 and prev_state and prev_state["pot"] > 0:
-                    hands.append(current_hand)
-                    current_hand = {
-                        "actions": [],
-                        "frames": []
-                    }
+                # First non-zero pot frame = blind frame
+                if prev_state and prev_state["pot"] == 0 and state["pot"] > 0:
 
-                current_hand["frames"].append(state)
-                current_hand["actions"].extend(actions)
+                    blind_info = detect_blinds_and_antes(prev_state, state)
+
+                    if blind_info:
+                        hands.append({
+                            "blind_structure": blind_info,
+                            "frames": []
+                        })
+
+                if hands:
+                    hands[-1]["frames"].append(state)
 
                 prev_state = state
-
-            if current_hand["frames"]:
-                hands.append(current_hand)
 
             results.append({
                 "hands_detected": len(hands),
