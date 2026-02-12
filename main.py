@@ -1,4 +1,5 @@
 # main.py
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -35,11 +36,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "json-engine-v2.1"
+BUILD_ID = "json-engine-v3-stable"
 
 
 # --------------------------------------------------
-# 🔥 HEALTH ENDPOINT (CRITICAL FOR GPT ACTIONS)
+# Health Endpoint (REQUIRED FOR GPT ACTIONS)
 # --------------------------------------------------
 
 @app.get("/")
@@ -53,46 +54,46 @@ async def root():
 
 class OpenAIFileRef(BaseModel):
     download_link: str
+
     class Config:
         extra = "allow"
+
 
 class ParseRequest(BaseModel):
     openaiFileIdRefs: List[OpenAIFileRef]
     options: Optional[Dict[str, Any]] = None
+
     class Config:
         extra = "allow"
 
 
 # --------------------------------------------------
-# File Fetch
+# File Download (SAFE VERSION)
 # --------------------------------------------------
 
 def fetch_pdf_bytes(download_link: str) -> bytes:
+    """
+    GPT Actions provides a signed HTTPS URL.
+    We download it directly.
+    """
+    if not isinstance(download_link, str):
+        raise ValueError("download_link must be a string")
+
     download_link = download_link.strip()
 
-    if download_link.startswith("http"):
-        r = requests.get(download_link, timeout=60)
-        r.raise_for_status()
-        return r.content
+    if not download_link.startswith("http"):
+        raise ValueError(f"Unsupported download_link format: {download_link}")
 
-    if download_link.startswith("/mnt/") and os.path.exists(download_link):
-        with open(download_link, "rb") as f:
-            return f.read()
-
-    if download_link.startswith("file-") or download_link.startswith("file_"):
-        from openai import OpenAI
-        client = OpenAI()
-        response = client.files.content(download_link)
-        return response.read()
-
-    raise ValueError("Unsupported download_link format")
+    r = requests.get(download_link, timeout=60)
+    r.raise_for_status()
+    return r.content
 
 
 # --------------------------------------------------
 # OCR Helpers
 # --------------------------------------------------
 
-def ocr_digits(img):
+def ocr_digits(img: Image.Image) -> Optional[int]:
     if not OCR_AVAILABLE:
         return None
 
@@ -108,12 +109,12 @@ def ocr_digits(img):
 
     try:
         return int(cleaned)
-    except:
+    except Exception:
         return None
 
 
 # --------------------------------------------------
-# Geometry Helpers
+# Geometry
 # --------------------------------------------------
 
 def polar(cx, cy, r, deg):
@@ -121,7 +122,7 @@ def polar(cx, cy, r, deg):
     return int(cx + r * math.cos(rad)), int(cy + r * math.sin(rad))
 
 
-def extract_frame_state(image):
+def extract_frame_state(image: Image.Image):
 
     w, h = image.size
     cx = w // 2
@@ -145,12 +146,13 @@ def extract_frame_state(image):
             sy + box_h // 2
         )
 
-        stack = ocr_digits(image.crop(stack_box))
+        try:
+            stack = ocr_digits(image.crop(stack_box))
+        except Exception:
+            stack = None
 
         if stack and stack > 0:
-            seats[idx + 1] = {
-                "stack": stack
-            }
+            seats[idx + 1] = {"stack": stack}
 
     pot_box = (
         int(w * 0.45),
@@ -159,7 +161,10 @@ def extract_frame_state(image):
         int(h * 0.38)
     )
 
-    pot = ocr_digits(image.crop(pot_box)) or 0
+    try:
+        pot = ocr_digits(image.crop(pot_box)) or 0
+    except Exception:
+        pot = 0
 
     return {
         "seats": seats,
@@ -168,7 +173,7 @@ def extract_frame_state(image):
 
 
 # --------------------------------------------------
-# Blind + Ante Detection (Tolerant Mode)
+# Blind + Ante Detection (Defensive)
 # --------------------------------------------------
 
 def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
@@ -186,11 +191,14 @@ def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
         if not prev:
             continue
 
-        delta = prev["stack"] - curr["stack"]
-        if delta > 0:
-            deltas.append(delta)
+        try:
+            delta = prev["stack"] - curr["stack"]
+            if delta > 0:
+                deltas.append(delta)
+        except Exception:
+            continue
 
-    if not deltas:
+    if len(deltas) < 3:
         return None
 
     deltas.sort()
@@ -224,7 +232,7 @@ def detect_blinds_and_antes(prev_state, curr_state, tolerance=3):
 
 
 # --------------------------------------------------
-# API Endpoint
+# Main Endpoint
 # --------------------------------------------------
 
 @app.post("/parse_poker_pdf")
@@ -236,75 +244,82 @@ async def parse_poker_pdf(req: ParseRequest):
     results = []
     errors = []
 
-    for ref in req.openaiFileIdRefs:
+    try:
 
-        try:
-            pdf_bytes = fetch_pdf_bytes(ref.download_link)
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        for ref in req.openaiFileIdRefs:
 
-            frames = []
+            try:
+                pdf_bytes = fetch_pdf_bytes(ref.download_link)
+                doc = fitz.open(stream=pdf_bytes, filetype="pdf")
 
-            for i in range(doc.page_count):
-                page = doc.load_page(i)
-                pix = page.get_pixmap(dpi=150)
-                img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
+                frames = []
 
-                state = extract_frame_state(img)
-                frames.append(state)
+                for i in range(doc.page_count):
+                    page = doc.load_page(i)
+                    pix = page.get_pixmap(dpi=150)
+                    img = Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
 
-            doc.close()
+                    state = extract_frame_state(img)
+                    frames.append(state)
 
-            hands = []
-            prev_state = None
+                doc.close()
 
-            for state in frames:
+                hands = []
+                prev_state = None
 
-                # New hand detection via pot reset
-                if prev_state and prev_state["pot"] > 0 and state["pot"] == 0:
-                    prev_state = None
-                    continue
+                for state in frames:
 
-                # Detect blind frame
-                if prev_state and prev_state["pot"] == 0 and state["pot"] > 0:
-                    blind_info = detect_blinds_and_antes(prev_state, state)
-                    if blind_info:
-                        hands.append({
-                            "blind_structure": blind_info,
-                            "frames": []
-                        })
+                    # Detect new hand by pot reset
+                    if prev_state and prev_state.get("pot", 0) > 0 and state.get("pot", 0) == 0:
+                        prev_state = None
+                        continue
 
-                if hands:
-                    hands[-1]["frames"].append(state)
+                    # Detect blind frame
+                    if prev_state and prev_state.get("pot", 0) == 0 and state.get("pot", 0) > 0:
+                        blind_info = detect_blinds_and_antes(prev_state, state)
+                        if blind_info:
+                            hands.append({
+                                "blind_structure": blind_info,
+                                "frames": []
+                            })
 
-                prev_state = state
+                    if hands:
+                        hands[-1]["frames"].append(state)
 
-            results.append({
-                "hands_detected": len(hands),
-                "hands": hands
-            })
+                    prev_state = state
 
-        except Exception as e:
-            err = {
-                "type": type(e).__name__,
-                "message": str(e)
-            }
+                results.append({
+                    "hands_detected": len(hands),
+                    "hands": hands
+                })
 
-            if debug:
-                err["traceback"] = traceback.format_exc()
+            except Exception as inner_e:
+                err = {
+                    "type": type(inner_e).__name__,
+                    "message": str(inner_e)
+                }
+                if debug:
+                    err["traceback"] = traceback.format_exc()
+                errors.append(err)
 
-            errors.append(err)
+    except Exception as outer_e:
+        errors.append({
+            "type": type(outer_e).__name__,
+            "message": str(outer_e),
+            "traceback": traceback.format_exc()
+        })
 
     payload = {
         "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
         "results": results,
-        "errors": errors,
+        "errors": errors
     }
 
     return {
         "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
         "errors_count": len(errors),
-        "hands_detected": sum(r["hands_detected"] for r in results),
-        "hand_history_text": json.dumps(payload, indent=2),
+        "hands_detected": sum(r.get("hands_detected", 0) for r in results),
+        "hand_history_text": json.dumps(payload, indent=2)
     }
