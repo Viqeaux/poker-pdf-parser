@@ -3,13 +3,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Any, List, Optional, Dict
-import io
 import json
 import traceback
 import os
+import math
+import io
 
 import requests
 import fitz  # PyMuPDF
+from PIL import Image, ImageOps
 
 # OCR optional
 try:
@@ -25,7 +27,6 @@ except Exception:
 
 app = FastAPI()
 
-# 🔥 REQUIRED FOR GPT ACTIONS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -34,7 +35,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BUILD_ID = "production-v5"
+BUILD_ID = "phase1-seat-detection-v1"
 
 
 # ----------------------------
@@ -45,7 +46,7 @@ class OpenAIFileRef(BaseModel):
     download_link: str
 
     class Config:
-        extra = "allow"  # critical for GPT bridge
+        extra = "allow"
 
 
 class ParseRequest(BaseModel):
@@ -53,7 +54,7 @@ class ParseRequest(BaseModel):
     options: Optional[Dict[str, Any]] = None
 
     class Config:
-        extra = "allow"  # critical for GPT bridge
+        extra = "allow"
 
 
 # ----------------------------
@@ -61,23 +62,23 @@ class ParseRequest(BaseModel):
 # ----------------------------
 
 def fetch_pdf_bytes(download_link: str) -> bytes:
-    if not isinstance(download_link, str) or not download_link.strip():
-        raise ValueError("download_link must be a non-empty string")
+    if not download_link:
+        raise ValueError("download_link is empty")
 
     download_link = download_link.strip()
 
-    # Case 1: Signed URL from GPT Actions (production case)
+    # Signed URL
     if download_link.startswith("http://") or download_link.startswith("https://"):
         r = requests.get(download_link, timeout=60)
         r.raise_for_status()
         return r.content
 
-    # Case 2: Local path (rare tool runtime case)
+    # Local path (rare case)
     if download_link.startswith("/mnt/") and os.path.exists(download_link):
         with open(download_link, "rb") as f:
             return f.read()
 
-    # Case 3: OpenAI file ID
+    # OpenAI file ID
     if download_link.startswith("file-") or download_link.startswith("file_"):
         from openai import OpenAI
         client = OpenAI()
@@ -88,13 +89,84 @@ def fetch_pdf_bytes(download_link: str) -> bytes:
 
 
 # ----------------------------
-# Minimal PDF Validation
+# Geometry Helpers
 # ----------------------------
 
-def count_pages(pdf_bytes: bytes) -> int:
+def polar_to_cartesian(cx, cy, radius, angle_deg):
+    angle_rad = math.radians(angle_deg)
+    x = cx + radius * math.cos(angle_rad)
+    y = cy + radius * math.sin(angle_rad)
+    return int(x), int(y)
+
+
+def ocr_digits_only(img):
+    if not OCR_AVAILABLE or pytesseract is None:
+        return None
+
+    gray = ImageOps.autocontrast(ImageOps.grayscale(img))
+    text = pytesseract.image_to_string(
+        gray,
+        config="--psm 7 -c tessedit_char_whitelist=0123456789,"
+    )
+
+    cleaned = "".join(c for c in text if c in "0123456789")
+    if not cleaned:
+        return None
+
+    try:
+        return int(cleaned)
+    except:
+        return None
+
+
+def extract_seats_and_stacks(image):
+    w, h = image.size
+
+    # Table center tuned for 1280x720 PokerStars layout
+    cx = w // 2
+    cy = int(h * 0.44)
+    radius = int(w * 0.35)
+
+    seat_angles = [-90, -50, -10, 30, 70, 110, 150, 190, 230]
+
+    seats = []
+
+    for idx, angle in enumerate(seat_angles):
+        sx, sy = polar_to_cartesian(cx, cy, radius, angle)
+
+        box_w = int(w * 0.09)
+        box_h = int(h * 0.05)
+
+        stack_box = (
+            sx - box_w // 2,
+            sy - box_h // 2,
+            sx + box_w // 2,
+            sy + box_h // 2
+        )
+
+        crop = image.crop(stack_box)
+        stack_value = ocr_digits_only(crop)
+
+        if stack_value and stack_value > 0:
+            seats.append({
+                "seat_index": idx + 1,
+                "stack": stack_value,
+                "anchor": (sx, sy)
+            })
+
+    return seats
+
+
+# ----------------------------
+# Frame Rendering
+# ----------------------------
+
+def render_page_to_image(pdf_bytes: bytes, page_index: int = 0) -> Image.Image:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     try:
-        return doc.page_count
+        page = doc.load_page(page_index)
+        pix = page.get_pixmap(dpi=150)
+        return Image.open(io.BytesIO(pix.tobytes("png"))).convert("RGB")
     finally:
         doc.close()
 
@@ -109,16 +181,20 @@ async def parse_poker_pdf(req: ParseRequest):
     opts = req.options or {}
     debug = bool(opts.get("debug", False))
 
-    out_results: List[Dict[str, Any]] = []
-    out_errors: List[Dict[str, Any]] = []
+    out_results = []
+    out_errors = []
 
     for ref in req.openaiFileIdRefs:
         try:
             pdf_bytes = fetch_pdf_bytes(ref.download_link)
-            pages_scanned = count_pages(pdf_bytes)
+
+            image = render_page_to_image(pdf_bytes, page_index=0)
+
+            seats = extract_seats_and_stacks(image)
 
             out_results.append({
-                "pages_scanned": pages_scanned
+                "detected_seats": seats,
+                "seat_count": len(seats)
             })
 
         except Exception as e:
