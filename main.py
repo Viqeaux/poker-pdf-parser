@@ -1,7 +1,7 @@
 # main.py
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import Any, List, Optional, Dict, Tuple
+from typing import Any, List, Optional, Dict
 import io
 import json
 import traceback
@@ -9,7 +9,7 @@ import os
 
 import requests
 import fitz  # PyMuPDF
-from PIL import Image, ImageStat, ImageOps
+from PIL import Image
 
 # OCR optional
 try:
@@ -20,24 +20,30 @@ except Exception:
     OCR_AVAILABLE = False
 
 app = FastAPI()
-BUILD_ID = "ocr-rank-norm-v3"
+BUILD_ID = "ocr-rank-norm-v4"
 
 
 # ----------------------------
-# Request Models
+# Request Models (ALLOW EXTRAS)
 # ----------------------------
 
 class OpenAIFileRef(BaseModel):
     download_link: str
+
+    class Config:
+        extra = "allow"   # 🔥 critical for GPT bridge
 
 
 class ParseRequest(BaseModel):
     openaiFileIdRefs: List[OpenAIFileRef]
     options: Optional[Dict[str, Any]] = None
 
+    class Config:
+        extra = "allow"   # 🔥 critical for GPT bridge
+
 
 # ----------------------------
-# File Fetch Helper (NEW)
+# File Fetch Helper
 # ----------------------------
 
 def fetch_pdf_bytes(download_link: str) -> bytes:
@@ -46,18 +52,18 @@ def fetch_pdf_bytes(download_link: str) -> bytes:
 
     download_link = download_link.strip()
 
-    # Case 1: Signed URL
+    # Case 1: Signed URL (GPT Actions production)
     if download_link.startswith("http://") or download_link.startswith("https://"):
         r = requests.get(download_link, timeout=60)
         r.raise_for_status()
         return r.content
 
-    # Case 2: Local file path (tool environment)
+    # Case 2: Local file path (tool runtime)
     if download_link.startswith("/mnt/") and os.path.exists(download_link):
         with open(download_link, "rb") as f:
             return f.read()
 
-    # Case 3: OpenAI file ID
+    # Case 3: OpenAI file ID (file-xxxx)
     if download_link.startswith("file-") or download_link.startswith("file_"):
         from openai import OpenAI
         client = OpenAI()
@@ -68,7 +74,19 @@ def fetch_pdf_bytes(download_link: str) -> bytes:
 
 
 # ----------------------------
-# API
+# Minimal PDF Validation
+# ----------------------------
+
+def count_pages(pdf_bytes: bytes) -> int:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        return doc.page_count
+    finally:
+        doc.close()
+
+
+# ----------------------------
+# API Endpoint
 # ----------------------------
 
 @app.post("/parse_poker_pdf")
@@ -83,10 +101,7 @@ async def parse_poker_pdf(req: ParseRequest):
     for ref in req.openaiFileIdRefs:
         try:
             pdf_bytes = fetch_pdf_bytes(ref.download_link)
-
-            doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-            pages_scanned = doc.page_count
-            doc.close()
+            pages_scanned = count_pages(pdf_bytes)
 
             out_results.append({
                 "pages_scanned": pages_scanned
@@ -97,9 +112,11 @@ async def parse_poker_pdf(req: ParseRequest):
                 "type": type(e).__name__,
                 "message": str(e)
             }
+
             if debug:
                 err["traceback"] = traceback.format_exc()
                 err["download_link"] = ref.download_link
+
             out_errors.append(err)
 
     payload = {
