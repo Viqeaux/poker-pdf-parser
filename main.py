@@ -28,6 +28,15 @@ class ParseRequest(BaseModel):
     options: Optional[dict] = None
 
 
+# IMPORTANT: Response model so OpenAPI is valid for GPT Actions (no more {} schema).
+class ParseResponse(BaseModel):
+    BUILD_ID: str
+    ocr_available: bool
+    errors_count: int
+    hands_detected: int
+    hand_history_text: str
+
+
 # ----------------------------
 # Rendering
 # ----------------------------
@@ -120,32 +129,40 @@ def ocr_rank_raw(rank_crop: Image.Image) -> str:
 
 
 def normalize_rank(raw: Optional[str]) -> Optional[str]:
+    """
+    Normalize OCR output to a single rank char:
+      A K Q J T 9 8 7 6 5 4 3 2
+    Returns None if unknown/unreliable.
+    """
     if raw is None:
         return None
     s = str(raw).strip().upper()
     if not s or s == "?":
         return None
 
-    # keep only plausible characters
-    s = "".join(ch for ch in s if ch in "AKQJT9876543210O")
+    # Keep only plausible characters, including common OCR mistakes we want to detect.
+    s = "".join(ch for ch in s if ch in "AKQJT9876543210OI")
 
     if not s:
         return None
 
-    # normalize common 10 forms
-    if "10" in s or s in ("IO", "1O", "I0", "1Ø"):
+    # Normalize "10" and common OCR variants (IO, 1O, I0)
+    if "10" in s or s in ("IO", "1O", "I0"):
         return "T"
-    if s == "0":
-        return None
 
-    # OCR confusions
-    # O is not a rank; treat as likely 0/10 noise unless paired above
+    # Remove characters that can't be ranks but appear from OCR.
+    # 'O' is not a rank; treat as noise unless it was part of 10 above.
     s = s.replace("O", "")
+    # 'I' can look like '1' or 'T'; treat as noise unless it was part of 10 above.
+    s = s.replace("I", "")
+
+    # Drop '1' and '0' leftovers (no rank 1; 0 only for 10 handled above).
+    s = s.replace("1", "").replace("0", "")
 
     if not s:
         return None
 
-    # If multiple chars survived, pick best guess
+    # If multiple chars survived, pick the best guess.
     for ch in s:
         if ch in "AKQJT":
             return ch
@@ -173,7 +190,7 @@ def ranks_expected_for_street(street: str) -> Tuple[bool, bool, bool]:
 # ----------------------------
 # API
 # ----------------------------
-@app.post("/parse_poker_pdf")
+@app.post("/parse_poker_pdf", response_model=ParseResponse)
 async def parse_poker_pdf(req: ParseRequest):
     refs = req.openaiFileIdRefs or []
     opts = req.options or {}
@@ -244,6 +261,7 @@ async def parse_poker_pdf(req: ParseRequest):
                                 "end_reason": None,
                             }
 
+                        # End due to large gap between *change pages*
                         if current and last_change_page is not None and (p - last_change_page) > max_gap_pages:
                             current["end_page_index"] = last_change_page
                             current["partial"] = True
@@ -251,6 +269,7 @@ async def parse_poker_pdf(req: ParseRequest):
                             hand_windows.append(current)
                             current = None
 
+                        # End when we return to PREFLOP after a hand started
                         if s == "PREFLOP" and current is not None:
                             current["end_page_index"] = last_change_page
                             current["partial"] = False
@@ -260,6 +279,7 @@ async def parse_poker_pdf(req: ParseRequest):
 
                         last_change_page = p
 
+                    # Still open at end-of-scan
                     if current is not None:
                         current["end_page_index"] = last_change_page
                         current["partial"] = True
@@ -339,6 +359,7 @@ async def parse_poker_pdf(req: ParseRequest):
         "errors": out_errors,
     }
 
+    # Return fields that match ParseResponse, so OpenAPI shows real properties (Actions-friendly).
     return {
         "BUILD_ID": BUILD_ID,
         "ocr_available": OCR_AVAILABLE,
